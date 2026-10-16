@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-proxy-standard"
+version = "0.1.0"
+description = "Isolated native-protocol Cortex proxy; offline candidate, not deployed"
+requires-python = ">=3.11"
+dependencies = ["fastapi==0.139.2", "starlette==1.3.1", "httpx==0.28.1", "uvicorn==0.51.0", "anyio==4.14.2", "pydantic==2.13.4", "cryptography==50.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

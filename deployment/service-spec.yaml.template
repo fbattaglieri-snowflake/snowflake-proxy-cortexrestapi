@@ -1,0 +1,31 @@
+# NOT DEPLOYABLE until placeholders, trust mount and resource budget are approved.
+# Service/pool names and instance counts belong to separately reviewed provisioning.
+spec:
+  containers:
+    - name: inference
+      image: ${APPROVED_IMAGE_AT_SHA256}
+      env:
+        PROXY_ACCOUNT: ${VERIFIED_ACCOUNT_LOCATOR}
+        PROXY_ARTIFACT: ${APPROVED_ARTIFACT_SHA256}
+        PROXY_TRUST_FILE: /config/trust.json
+        PROXY_REGISTRY_URL: ${APPROVED_PRIVATE_REGISTRY_ORIGIN}/snapshot
+      volumeMounts:
+        - name: trust
+          mountPath: /config
+      resources:
+        requests:
+          cpu: ${APPROVED_CPU_REQUEST}
+          memory: ${APPROVED_MEMORY_REQUEST}
+        limits:
+          cpu: ${APPROVED_CPU_LIMIT}
+          memory: ${APPROVED_MEMORY_LIMIT}
+      readinessProbe:
+        port: 8080
+        path: /readyz
+  endpoints:
+    - name: inference
+      port: 8080
+      public: false
+  volumes:
+    - name: trust
+      source: ${APPROVED_NEW_TRUST_STAGE}

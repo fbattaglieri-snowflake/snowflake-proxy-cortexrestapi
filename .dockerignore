@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!requirements.runtime.lock
+!src/
+!src/llm_proxy_standard/
+!src/llm_proxy_standard/*.py
