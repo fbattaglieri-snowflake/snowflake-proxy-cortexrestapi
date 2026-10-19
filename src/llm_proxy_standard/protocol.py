@@ -320,7 +320,7 @@ class Stream:
                 parts = item.get(field, [])
                 require(part_key in state["text_done"] and part_index < len(parts) and parts[part_index].get(text_key) == text, "Text delta/done/item mismatch")
             if state["initial"].get("encrypted_content"):
-                require(item.get("encrypted_content") == state["initial"]["encrypted_content"], "Opaque reasoning changed")
+                require(isinstance(item.get("encrypted_content"), str) and bool(item.get("encrypted_content")), "Opaque reasoning missing")
             state["done"] = item
             return
         require(body.get("item_id") == state["initial"]["id"], "Item identity mismatch")

@@ -62,12 +62,14 @@ class OrderedSDKTests(test_stream_replay.SDKStreamReplayTests):
 
 class OrderingTests(unittest.TestCase):
     def test_reordered_wire_validates_and_preserves_completed_document(self):
-        for initial_mode in ("missing", "empty"):
+        for initial_mode in ("missing", "empty", "placeholder"):
             values, expected = test_stream_replay.responses_tools(2)
             if initial_mode == "missing":
                 del values[1]["item"]["encrypted_content"]
-            else:
+            elif initial_mode == "empty":
                 values[1]["item"]["encrypted_content"] = ""
+            else:
+                values[1]["item"]["encrypted_content"] = "initial-placeholder"
             value = profile("responses", capabilities=["text", "tools", "parallel_tools", "reasoning", "streaming"])
             order = OrderedItems(1024 * 1024)
             frames = []

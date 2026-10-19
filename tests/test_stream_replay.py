@@ -63,8 +63,8 @@ def responses_tools(count):
                         "item_id": item["id"], "delta": item["arguments"]},
                        {"type": "response.function_call_arguments.done", "output_index": index,
                         "item_id": item["id"], "arguments": item["arguments"]}]
-        values.append({"type": "response.output_item.done", "output_index": index, "item": item})
-    values.append({"type": "response.completed", "response": {**document, "output": output}})
+        values.append({"type": "response.output_item.done", "output_index": index, "item": copy.deepcopy(item)})
+    values.append({"type": "response.completed", "response": {**document, "output": copy.deepcopy(output)}})
     for sequence, value in enumerate(values):
         value["sequence_number"] = sequence
     return values, output
@@ -209,14 +209,17 @@ class StreamLifecycleTests(unittest.TestCase):
     def test_responses_opaque_and_arguments_identity(self):
         values, _ = responses_tools(2)
         self.validate("responses", values)
-        empty_initial = copy.deepcopy(values)
-        empty_initial[1]["item"]["encrypted_content"] = ""
-        self.validate("responses", empty_initial)
-        for mutation in ("opaque", "arguments", "identity"):
+        for initial_opaque in ("", "initial-placeholder"):
+            progressed = copy.deepcopy(values)
+            progressed[1]["item"]["encrypted_content"] = initial_opaque
+            self.validate("responses", progressed)
+        for mutation in ("opaque", "opaque_missing", "arguments", "identity"):
             broken = copy.deepcopy(values)
             done = next(event for event in broken if event["type"] == "response.output_item.done")
             if mutation == "opaque":
                 done["item"]["encrypted_content"] = "changed"
+            elif mutation == "opaque_missing":
+                done["item"]["encrypted_content"] = ""
             elif mutation == "identity":
                 done["item"]["id"] = "changed"
             else:
