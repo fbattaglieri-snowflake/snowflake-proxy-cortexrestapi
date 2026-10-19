@@ -62,18 +62,23 @@ class OrderedSDKTests(test_stream_replay.SDKStreamReplayTests):
 
 class OrderingTests(unittest.TestCase):
     def test_reordered_wire_validates_and_preserves_completed_document(self):
-        values, expected = test_stream_replay.responses_tools(2)
-        del values[1]["item"]["encrypted_content"]
-        value = profile("responses", capabilities=["text", "tools", "parallel_tools", "reasoning", "streaming"])
-        order = OrderedItems(1024 * 1024)
-        frames = []
-        for raw in SSEParser().feed(test_app.sse("responses", values)):
-            frames.extend(order.feed(raw))
-        validator = Stream("responses", value)
-        for frame in frames:
-            validator.event(frame)
-        validator.finish()
-        self.assertEqual([validator.items[index]["done"] for index in range(3)], expected)
+        for initial_mode in ("missing", "empty"):
+            values, expected = test_stream_replay.responses_tools(2)
+            if initial_mode == "missing":
+                del values[1]["item"]["encrypted_content"]
+            else:
+                values[1]["item"]["encrypted_content"] = ""
+            value = profile("responses", capabilities=["text", "tools", "parallel_tools", "reasoning", "streaming"])
+            order = OrderedItems(1024 * 1024)
+            frames = []
+            for raw in SSEParser().feed(test_app.sse("responses", values)):
+                frames.extend(order.feed(raw))
+            validator = Stream("responses", value)
+            for frame in frames:
+                validator.event(frame)
+            validator.finish()
+            self.assertEqual([validator.items[index]["done"] for index in range(3)], expected)
+            self.assertEqual(validator.items[0]["initial"]["encrypted_content"], "synthetic-encrypted")
 
     def test_text_remains_incremental_and_buffer_bounded(self):
         order = OrderedItems(4096)

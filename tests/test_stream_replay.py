@@ -209,6 +209,9 @@ class StreamLifecycleTests(unittest.TestCase):
     def test_responses_opaque_and_arguments_identity(self):
         values, _ = responses_tools(2)
         self.validate("responses", values)
+        empty_initial = copy.deepcopy(values)
+        empty_initial[1]["item"]["encrypted_content"] = ""
+        self.validate("responses", empty_initial)
         for mutation in ("opaque", "arguments", "identity"):
             broken = copy.deepcopy(values)
             done = next(event for event in broken if event["type"] == "response.output_item.done")
