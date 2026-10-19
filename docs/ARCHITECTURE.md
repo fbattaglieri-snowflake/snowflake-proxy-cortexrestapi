@@ -30,7 +30,7 @@ When `ProfileV2.normalize_client_options = True`, the proxy transparently normal
    - Adds `include = ["reasoning.encrypted_content"]` when `reasoning` capability is enabled.
    - Strips empty `"text": {}` objects sent by n8n that would otherwise trigger `HTTP 400` upstream.
    - Strips unsupported `temperature` / `top_p` fields on reasoning Responses models.
-   - Enables `response_stream = "ordered-items"` (`stream_order.py`), reordering interleaved SSE events and ensuring `encrypted_content` finalized at `response.output_item.done` is present for `langchain-openai`.
+   - Enables `response_stream = "ordered-items"` (`stream_order.py` + `protocol.py`), reordering interleaved SSE events, accepting empty or provisional `encrypted_content` on `response.output_item.added`, verifying final `encrypted_content` equality between `response.output_item.done` and `response.completed`, and backfilling `response.output_item.added` so `langchain-openai`, `Langflow`, `Hermes`, and `n8n` receive the finalized opaque payload cleanly.
 3. **Chat Protocol Adjustments:**
    - Resolves conflicts when a client sends both `max_tokens` and `max_completion_tokens`.
    - Sets `reasoning_effort = "none"` when required by a profile (even if the client sends `"medium"` or omits it), and removes `reasoning_effort` on Chat models that do not support it.
