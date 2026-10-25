@@ -60,13 +60,17 @@ Whenever a new model is promoted into the Registry, Hermes discovers it automati
 
 ---
 
-## 3. Langflow
+## 3. Langflow / Native-Snowflake-Langflow
 
-Connect either standard Langflow model components or the reusable `Standard Chat`, `Standard Responses`, and `Standard Messages` components to:
+Connect either standard Langflow model components or the native `Proxy - Chat`, `Proxy - Responses`, and `Proxy - Messages` components (`StandardChat`, `StandardResponses`, `StandardMessages`) to:
 
 - **Chat:** `ORIGIN/chat/v1`
 - **Responses:** `ORIGIN/responses/v1` (with `use_responses_api=True`; the proxy serves `response_stream="ordered-items"` for full `langchain-openai` streaming compatibility)
 - **Messages:** `ORIGIN/messages`
+
+### Langflow Component AST Loader & Environment Variables
+- Configure `LLM_PROXY_BASE_URL` (or `SNOWFLAKE_STANDARD_PROXY_ORIGIN`) to `http://<PROXY_SERVICE>.<DNS_NAMESPACE>:8080` and include the proxy hostname in `LANGFLOW_SSRF_ALLOWED_HOSTS`.
+- **Important for custom Langflow components:** Langflow's `eval_custom_component_code` AST evaluator only extracts top-level `ast.Import` and `ast.ImportFrom` statements (and ignores module-level `try ... except ImportError:` blocks). Always use a top-level import (`from lfx_snowflake import standard_langflow`) in component files so `standard_langflow` is bound in component method globals.
 
 ---
 
