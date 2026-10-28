@@ -33,10 +33,10 @@ class Settings:
     concurrency: int = 8
     queue_size: int = 8
     queue_wait: float = 0.1
-    deadline: float = 180
-    max_body: int = 1024 * 1024
-    max_response: int = 16 * 1024 * 1024
-    send_timeout: float = 10
+    deadline: float = 600
+    max_body: int = 32 * 1024 * 1024
+    max_response: int = 32 * 1024 * 1024
+    send_timeout: float = 30
 
     def __post_init__(self):
         parsed = urlsplit(self.upstream)
@@ -141,7 +141,7 @@ def create_app(settings, cache, *, transport=None):
     @asynccontextmanager
     async def lifespan(app):
         async with httpx.AsyncClient(transport=transport, follow_redirects=False, trust_env=False,
-                timeout=httpx.Timeout(60, connect=10, write=30, pool=1),
+                timeout=httpx.Timeout(180, connect=10, write=60, pool=5),
                 limits=httpx.Limits(max_connections=settings.concurrency)) as client:
             app.state.client = client
             app.state.admission = Admission(settings)

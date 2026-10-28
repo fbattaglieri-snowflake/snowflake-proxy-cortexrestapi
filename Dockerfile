@@ -6,4 +6,4 @@ RUN python -m pip install --no-cache-dir -r requirements.runtime.lock && python 
 COPY src/llm_proxy_standard /opt/proxy/llm_proxy_standard
 USER 1000:1000
 EXPOSE 8080
-ENTRYPOINT ["python", "-m", "uvicorn", "llm_proxy_standard.app:environment", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log", "--timeout-graceful-shutdown", "185", "--h11-max-incomplete-event-size", "16384"]
+ENTRYPOINT ["python", "-m", "uvicorn", "llm_proxy_standard.app:environment", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log", "--timeout-graceful-shutdown", "605", "--h11-max-incomplete-event-size", "16384"]

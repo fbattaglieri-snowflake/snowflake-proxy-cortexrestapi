@@ -116,11 +116,12 @@ def _normalize_client_body(body, profile):
     common = {"model", "stream", "tools", "tool_choice", "temperature", "top_p"}
     allowed_top = common | {
         "chat": {"messages", "max_tokens", "max_completion_tokens", "reasoning_effort", "parallel_tool_calls", "stream_options", "response_format"},
-        "responses": {"input", "instructions", "max_output_tokens", "reasoning", "parallel_tool_calls", "store", "include", "text", "prompt_cache_key"},
+        "responses": {"input", "instructions", "max_output_tokens", "reasoning", "parallel_tool_calls", "store", "include", "text"},
         "messages": {"messages", "system", "max_tokens", "thinking", "output_config"},
     }[protocol] | {path.split(".")[0] for path in profile.constraints}
     harmless_extra = {"frequency_penalty", "presence_penalty", "user", "metadata", "seed", "logit_bias",
-                      "logprobs", "top_logprobs", "n", "service_tier", "stop", "stop_sequences", "store"}
+                      "logprobs", "top_logprobs", "n", "service_tier", "stop", "stop_sequences", "store",
+                      "prompt_cache_key", "prompt_cache_retention"}
     for key in list(effective):
         if key not in allowed_top and key in harmless_extra:
             old = effective.pop(key)
@@ -191,6 +192,20 @@ def _normalize_client_body(body, profile):
             effective.pop("text")
             changes.append({"id": "strip-empty-text", "path": "text", "requested": {}, "was_missing": False,
                             "effective": None, "removed": True, "reason": "Cortex Responses rejects empty text object", "effects": "Removed empty text object"})
+        if isinstance(effective.get("reasoning"), dict):
+            r_obj = effective["reasoning"]
+            re_c = profile.constraints.get("reasoning.effort")
+            if "effort" in r_obj and re_c and re_c.kind == "enum" and not re_c.accepts(r_obj["effort"]):
+                old_eff = r_obj["effort"]
+                r_obj["effort"] = "low" if "low" in re_c.values else re_c.values[0]
+                changes.append({"id": "clamp-reasoning-effort", "path": "reasoning.effort", "requested": old_eff, "was_missing": False,
+                                "effective": r_obj["effort"], "removed": False, "reason": "Clamp reasoning.effort to profile domain", "effects": "Normalized reasoning.effort"})
+            rs_c = profile.constraints.get("reasoning.summary")
+            if "summary" in r_obj and rs_c and rs_c.kind == "enum" and not rs_c.accepts(r_obj["summary"]):
+                old_sum = r_obj["summary"]
+                r_obj["summary"] = "auto" if "auto" in rs_c.values else rs_c.values[0]
+                changes.append({"id": "clamp-reasoning-summary", "path": "reasoning.summary", "requested": old_sum, "was_missing": False,
+                                "effective": r_obj["summary"], "removed": False, "reason": "Clamp reasoning.summary to profile domain", "effects": "Normalized reasoning.summary"})
     elif protocol == "messages":
         c = profile.constraints.get("max_tokens")
         max_cap = c.maximum if c and c.kind == "integer" else 128000
@@ -208,6 +223,17 @@ def _normalize_client_body(body, profile):
             old = effective["tool_choice"]
             effective["tool_choice"] = {"type": old}
         thinking = effective.get("thinking")
+        if isinstance(thinking, dict):
+            t_constraint = profile.constraints.get("thinking.type")
+            if t_constraint and not t_constraint.accepts(thinking.get("type")):
+                old_t = effective.pop("thinking")
+                changes.append({"id": "strip-unsupported-thinking-type", "path": "thinking", "requested": old_t, "was_missing": False,
+                                "effective": None, "removed": True, "reason": "Thinking mode not supported by profile", "effects": "Removed unsupported thinking block"})
+                if isinstance(effective.get("output_config"), dict) and set(effective["output_config"]) == {"effort"}:
+                    old_oc = effective.pop("output_config")
+                    changes.append({"id": "strip-orphan-output-config", "path": "output_config", "requested": old_oc, "was_missing": False,
+                                    "effective": None, "removed": True, "reason": "Adaptive effort paired with unsupported thinking mode", "effects": "Removed output_config.effort"})
+                thinking = None
         if isinstance(thinking, dict) and thinking.get("type") == "enabled":
             for temp_field in ("temperature", "top_p"):
                 if temp_field in effective:

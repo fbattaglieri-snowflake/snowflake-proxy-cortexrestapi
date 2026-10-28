@@ -29,16 +29,20 @@ When `ProfileV2.normalize_client_options = True`, the proxy transparently normal
    - Forces `store = false` (required by stateless Cortex Responses, even when n8n sends `store = true`).
    - Adds `include = ["reasoning.encrypted_content"]` when `reasoning` capability is enabled.
    - Strips empty `"text": {}` objects sent by n8n that would otherwise trigger `HTTP 400` upstream.
-   - Strips unsupported `temperature` / `top_p` fields on reasoning Responses models.
+   - Strips unsupported `temperature` / `top_p` fields and `prompt_cache_retention` hints on reasoning Responses models.
+   - Clamps out-of-domain `reasoning.effort` values (e.g. `"none"` / `"minimal"` -> `"low"`) and `reasoning.summary` values to the profile's declared enum domain.
    - Enables `response_stream = "ordered-items"` (`stream_order.py` + `protocol.py`), reordering interleaved SSE events, accepting empty or provisional `encrypted_content` on `response.output_item.added`, verifying final `encrypted_content` equality between `response.output_item.done` and `response.completed`, and backfilling `response.output_item.added` so `langchain-openai`, `Langflow`, `Hermes`, and `n8n` receive the finalized opaque payload cleanly.
 3. **Chat Protocol Adjustments:**
    - Resolves conflicts when a client sends both `max_tokens` and `max_completion_tokens`.
    - Sets `reasoning_effort = "none"` when required by a profile (even if the client sends `"medium"` or omits it), and removes `reasoning_effort` on Chat models that do not support it.
 4. **Messages Protocol Adjustments:**
+   - When `thinking.type` is outside the profile's supported enum (for example `"adaptive"` sent by clients before profile negotiation), strips the unsupported `thinking` block and paired `output_config.effort` instead of failing with `HTTP 400`.
    - When `thinking.type == "enabled"`, strips incompatible `temperature` / `top_p` parameters and bumps `max_tokens` if `max_tokens <= thinking.budget_tokens`.
    - Normalizes string `tool_choice` (`"auto"` / `"none"`) to `{"type": ...}`.
 5. **Multi-Round Tool Call ID Deduplication:**
    - Automatically renames reused tool call IDs (`call_0..call_N`) from prior closed turns (`call_0` -> `call_0_r2`) in both the assistant turn and matching tool result.
+6. **1M+ Token Context & Long-Stream Resource Bounds (`app.py`):**
+   - Defaults `max_body = 32 MiB` (`PROXY_MAX_BODY=33554432`), `max_response = 32 MiB` (`PROXY_MAX_RESPONSE=33554432`), `deadline = 600s` (`PROXY_DEADLINE=600`), and upstream `httpx.Timeout(180, connect=10, write=60, pool=5)` so 1M+ token context windows (`openai-gpt-6-astra`, `openai-gpt-6.1-sol`, `claude-opus-5-5`) with multi-round `reasoning.encrypted_content` blobs and long context-compression streams complete without premature `HTTP 413` rejections or mid-stream cutoff (`incomplete chunked read`).
 
 ## 4. Stateless Client `ReplayCache` (`replay_cache.py`)
 

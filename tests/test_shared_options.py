@@ -84,6 +84,50 @@ class OptionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ProfileV2.model_validate(data)
 
+    def test_large_payload_defaults_and_adaptive_thinking_normalization(self):
+        from pathlib import Path
+        from llm_proxy_standard.app import Settings
+        s = Settings("https://acct.snowflakecomputing.com/api/v2/cortex/v1", Path("/tmp/token"))
+        self.assertEqual(s.max_body, 32 * 1024 * 1024)
+        self.assertEqual(s.max_response, 32 * 1024 * 1024)
+        self.assertEqual(s.deadline, 600)
+        msg_data = flexible("messages", capabilities=["text", "reasoning"]).document()
+        msg_data["normalize_client_options"] = True
+        msg_data["constraints"].update({
+            "thinking.type": {"kind": "enum", "values": ["enabled", "disabled"]},
+            "thinking.budget_tokens": {"kind": "integer", "minimum": 1024, "maximum": 64000},
+            "output_config.effort": {"kind": "enum", "values": ["low", "medium", "high"]},
+        })
+        msg_prof = ProfileV2.model_validate(msg_data)
+        eff, changes = prepare({
+            "model": msg_prof.id,
+            "messages": [{"role": "user", "content": "x" * (2 * 1024 * 1024)}],
+            "max_tokens": 2048,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "medium"},
+        }, msg_prof)
+        self.assertNotIn("thinking", eff)
+        self.assertNotIn("output_config", eff)
+        self.assertTrue(any(c["id"] == "strip-unsupported-thinking-type" for c in changes))
+        resp_data = flexible("responses", capabilities=["text", "reasoning"]).document()
+        resp_data["normalize_client_options"] = True
+        resp_data["constraints"].update({
+            "store": {"kind": "enum", "values": [False]},
+            "include": {"kind": "enum", "values": [["reasoning.encrypted_content"], []]},
+            "reasoning.effort": {"kind": "enum", "values": ["low", "medium", "high"]},
+            "reasoning.summary": {"kind": "enum", "values": ["auto", "concise", "detailed"]},
+        })
+        resp_prof = ProfileV2.model_validate(resp_data)
+        eff_r, changes_r = prepare({
+            "model": resp_prof.id,
+            "input": [{"role": "user", "content": "summarize"}],
+            "reasoning": {"effort": "none", "summary": "invalid"},
+            "prompt_cache_retention": "in_memory",
+        }, resp_prof)
+        self.assertEqual(eff_r["reasoning"], {"effort": "low", "summary": "auto"})
+        self.assertNotIn("prompt_cache_retention", eff_r)
+        self.assertTrue(any(c["id"] == "clamp-reasoning-effort" for c in changes_r))
+
 
 class HTTPOptionTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_app.AppTests.asyncSetUp
