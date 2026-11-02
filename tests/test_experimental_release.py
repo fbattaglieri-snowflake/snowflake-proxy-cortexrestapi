@@ -93,3 +93,42 @@ class ExperimentalTests(unittest.TestCase):
                 publisher.close()
             restarted = Publisher(registry, inbox, checkpoints)
             restarted.close()
+
+    def test_inbox_administrative_revocation_package(self):
+        entry, report = experimental()
+        trust = Trust({}, ACCOUNT, ARTIFACT, UPSTREAM,
+                      experimental_entries=[digest(entry.document())],
+                      admin_approvers=["fixture-admin"])
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            inbox, checkpoints = root / "inbox", root / "checkpoints"
+            inbox.mkdir()
+            checkpoints.mkdir()
+            record = inbox / "record.data"
+            record.write_bytes(canonical(report))
+            package = {"entry": entry.document(), "bundle": [{"kind": "experimental-record", "path": "record.data"}]}
+            pub_path = inbox / (digest(package) + ".json")
+            pub_path.write_bytes(canonical(package))
+            registry = Registry(root / "registry.sqlite", trust)
+            publisher = Publisher(registry, inbox, checkpoints)
+            try:
+                rev1 = publisher.consume(pub_path)
+                revoke_pkg = {
+                    "revoke": {
+                        "account": ACCOUNT,
+                        "approver": "fixture-admin",
+                        "expected_revision": rev1,
+                        "id": entry.proposal.profile.id,
+                        "issued_at": utcnow().isoformat(),
+                        "method": "administrative-standard-v1",
+                        "reason": "Model disappeared from account snapshot",
+                    }
+                }
+                rev_path = inbox / (digest(revoke_pkg) + ".json")
+                rev_path.write_bytes(canonical(revoke_pkg))
+                rev2 = publisher.consume(rev_path)
+                self.assertNotEqual(rev1, rev2)
+                self.assertIn(entry.proposal.profile.id, registry.read().revoked)
+                self.assertEqual(publisher.consume(rev_path), rev2)
+            finally:
+                publisher.close()

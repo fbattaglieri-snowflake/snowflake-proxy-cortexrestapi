@@ -32,7 +32,7 @@ DEFAULT_CAPS = ["text", "tools", "parallel_tools", "streaming", "reasoning"]
 
 def build_universal_profile(model_id, protocol, artifact, *, account="EXAMPLE_ACCOUNT",
                             revision="universal-v2", reasoning_none=False,
-                            capabilities=None, now=None, days=365):
+                            reasoning_efforts=None, capabilities=None, now=None, days=365):
     now = now or utcnow()
     expires = (now + timedelta(days=days)).isoformat()
     caps = list(capabilities or DEFAULT_CAPS)
@@ -47,6 +47,8 @@ def build_universal_profile(model_id, protocol, artifact, *, account="EXAMPLE_AC
         }
         if reasoning_none:
             constraints["reasoning_effort"] = OptionConstraint(kind="enum", values=["none"])
+        elif reasoning_efforts:
+            constraints["reasoning_effort"] = OptionConstraint(kind="enum", values=list(reasoning_efforts))
         stream_mode = "native"
     elif protocol == "responses":
         constraints = {
@@ -153,28 +155,77 @@ def build_package_for_profile(profile, expected_revision, *,
     return entry, report, evidence_name, package, package_name
 
 
+def build_revoke_package(model_id, expected_revision, *, approver="operator-admin",
+                         account="EXAMPLE_ACCOUNT", reason="Automated removal of disappeared model", now=None):
+    now = now or utcnow()
+    package = {
+        "revoke": {
+            "account": account,
+            "approver": approver,
+            "expected_revision": expected_revision,
+            "id": model_id,
+            "issued_at": now.isoformat(),
+            "method": "administrative-standard-v1",
+            "reason": reason,
+        }
+    }
+    package_name = digest(package) + ".json"
+    return package, package_name
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--protocol", required=True, choices=("chat", "responses", "messages"))
+    parser.add_argument("--protocol", choices=("chat", "responses", "messages"))
     parser.add_argument("--account", required=True, help="Snowflake account locator")
-    parser.add_argument("--upstream", required=True, help="https://<host>/api/v2/cortex/v1")
-    parser.add_argument("--artifact", required=True)
+    parser.add_argument("--upstream", help="https://<host>/api/v2/cortex/v1")
+    parser.add_argument("--artifact", help="64-hex artifact digest")
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--approver", required=True)
     parser.add_argument("--previous-entry", default=None)
     parser.add_argument("--reasoning-none", action="store_true")
+    parser.add_argument("--reasoning-efforts", nargs="+", default=None)
+    parser.add_argument("--capabilities", nargs="+", default=None)
     parser.add_argument("--revision", default="promoted-v2")
     parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("--revoke", action="store_true", help="Build and optionally upload an administrative revocation package")
+    parser.add_argument("--reason", default="Automated removal of disappeared model")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--stage-inbox", default=None, help="Optional Snowflake stage inbox e.g. @DB.SCHEMA.STAGE/inbox")
     parser.add_argument("--connection", default=None, help="Snowflake CLI connection name for stage upload")
     args = parser.parse_args()
 
+    args.output_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if args.revoke:
+        package, package_name = build_revoke_package(
+            args.model, args.expected_revision,
+            approver=args.approver, account=args.account, reason=args.reason,
+        )
+        pkg_path = args.output_dir / package_name
+        with os.fdopen(os.open(pkg_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "wb") as f:
+            f.write(canonical(package))
+        if args.stage_inbox:
+            cmd = ["snow", "sql", "-q", f"PUT 'file://{pkg_path}' {args.stage_inbox.rstrip('/')}/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE"]
+            if args.connection:
+                cmd.extend(["--connection", args.connection])
+            subprocess.check_call(cmd)
+        print(json.dumps({
+            "model": args.model,
+            "action": "revoke",
+            "expected_revision": args.expected_revision,
+            "package": package_name,
+            "uploaded": bool(args.stage_inbox),
+        }))
+        return
+
+    if not args.protocol or not args.upstream or not args.artifact:
+        parser.error("--protocol, --upstream, and --artifact are required unless --revoke is set")
+
     profile = build_universal_profile(
         args.model, args.protocol, args.artifact,
         account=args.account, revision=args.revision,
-        reasoning_none=args.reasoning_none, days=args.days,
+        reasoning_none=args.reasoning_none, reasoning_efforts=args.reasoning_efforts,
+        capabilities=args.capabilities, days=args.days,
     )
     entry, report, evidence_name, package, package_name = build_package_for_profile(
         profile, args.expected_revision,

@@ -1,0 +1,274 @@
+-- =============================================================================
+-- Automated Daily Cortex Model Scouting, Qualification, Promotion & Removal
+-- Replace placeholders (<DB>, <SCHEMA>, <WAREHOUSE>, <COMPUTE_POOL>,
+-- <ARTIFACTS_STAGE>, <QUALIFICATION_IMAGE>, <EMAIL_INTEGRATION>, <RECIPIENT_EMAIL>)
+-- before executing with: snow sql --enable-templating NONE -f setup_daily_scout_task.sql
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS <DB>.<SCHEMA>.MODEL_SNAPSHOT_HISTORY (
+    SNAPSHOT_ID VARCHAR(64) NOT NULL,
+    CAPTURED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+    TOTAL_MODELS NUMBER(10,0),
+    CORTEX_BASE_MODELS NUMBER(10,0),
+    MODELS_JSON VARIANT
+);
+
+CREATE TABLE IF NOT EXISTS <DB>.<SCHEMA>.MODEL_SCOUTING_RUNS (
+    RUN_ID VARCHAR(64) NOT NULL,
+    RUN_TIMESTAMP TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+    PREVIOUS_SNAPSHOT_SOURCE VARCHAR(512),
+    PREV_MODEL_COUNT NUMBER(10,0),
+    CURR_MODEL_COUNT NUMBER(10,0),
+    ADDED_MODELS VARIANT,
+    REMOVED_MODELS VARIANT,
+    TESTED_MODELS VARIANT,
+    PROMOTED_MODELS VARIANT,
+    REVOKED_MODELS VARIANT,
+    BLOCKED_MODELS VARIANT,
+    ACTIVE_CATALOG_BY_CHANNEL VARIANT,
+    CONSUMER_SYNC_STATUS VARIANT,
+    ACTION_TAKEN BOOLEAN,
+    NOTIFICATION_SENT BOOLEAN,
+    REPORT_MARKDOWN VARCHAR,
+    REPORT_JSON VARIANT
+);
+
+CREATE OR REPLACE VIEW <DB>.<SCHEMA>.V_LATEST_MODEL_SCOUTING_REPORT AS
+SELECT
+    RUN_ID,
+    RUN_TIMESTAMP,
+    PREV_MODEL_COUNT,
+    CURR_MODEL_COUNT,
+    ARRAY_SIZE(ADDED_MODELS) AS NEW_CORTEX_BASE_COUNT,
+    ADDED_MODELS,
+    REMOVED_MODELS,
+    TESTED_MODELS,
+    PROMOTED_MODELS,
+    REVOKED_MODELS,
+    BLOCKED_MODELS,
+    ACTIVE_CATALOG_BY_CHANNEL,
+    ACTION_TAKEN,
+    NOTIFICATION_SENT,
+    REPORT_MARKDOWN
+FROM <DB>.<SCHEMA>.MODEL_SCOUTING_RUNS
+ORDER BY RUN_TIMESTAMP DESC;
+
+CREATE OR REPLACE PROCEDURE <DB>.<SCHEMA>.RUN_DAILY_MODEL_SCOUT()
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+EXECUTE AS CALLER
+AS
+$$
+import json
+import html
+from datetime import datetime, timezone
+
+def main(session):
+    now_dt = datetime.now(timezone.utc)
+    run_id = now_dt.strftime('%Y%m%d_%H%M%S')
+
+    curr_rows = session.sql('SHOW MODELS IN ACCOUNT').collect()
+    curr_models = []
+    curr_map = {}
+    for r in curr_rows:
+        d = r.as_dict()
+        name = str(d.get('name', '')).lower()
+        row_clean = {
+            'name': d.get('name'),
+            'model_type': d.get('model_type'),
+            'created_on': str(d.get('created_on')),
+            'owner': d.get('owner'),
+        }
+        curr_models.append(row_clean)
+        curr_map[name] = row_clean
+
+    prev_rows = session.sql("""
+        SELECT SNAPSHOT_ID, MODELS_JSON
+        FROM <DB>.<SCHEMA>.MODEL_SNAPSHOT_HISTORY
+        ORDER BY CAPTURED_AT DESC
+        LIMIT 1
+    """).collect()
+
+    if prev_rows:
+        prev_source = f"MODEL_SNAPSHOT_HISTORY:{prev_rows[0]['SNAPSHOT_ID']}"
+        raw_prev = prev_rows[0]['MODELS_JSON']
+        prev_doc = json.loads(raw_prev) if isinstance(raw_prev, str) else raw_prev
+        prev_list = prev_doc.get('models', prev_doc) if isinstance(prev_doc, dict) else prev_doc
+        prev_map = {str(m.get('name', '')).lower(): m for m in prev_list}
+    else:
+        prev_source = 'INITIAL_BASELINE'
+        prev_map = curr_map
+
+    cat_rows = session.sql("""
+        SELECT ACTIVE_CATALOG_BY_CHANNEL
+        FROM <DB>.<SCHEMA>.MODEL_SCOUTING_RUNS
+        ORDER BY RUN_TIMESTAMP DESC
+        LIMIT 1
+    """).collect()
+    if cat_rows and cat_rows[0]['ACTIVE_CATALOG_BY_CHANNEL']:
+        raw_cat = cat_rows[0]['ACTIVE_CATALOG_BY_CHANNEL']
+        active_cat = json.loads(raw_cat) if isinstance(raw_cat, str) else raw_cat
+    else:
+        active_cat = {'messages': [], 'chat': [], 'responses': []}
+    active_set = set(active_cat.get('messages', [])) | set(active_cat.get('chat', [])) | set(active_cat.get('responses', []))
+
+    added_all = sorted(set(curr_map) - set(prev_map))
+    removed_all = sorted(set(prev_map) - set(curr_map))
+    added_cortex_base = [m for m in added_all if str(curr_map[m].get('model_type', '')).upper() == 'CORTEX_BASE']
+    disappeared_active = sorted(m for m in active_set if m.lower() not in curr_map)
+
+    action_taken = bool(added_cortex_base or disappeared_active)
+    tested_models = []
+    promoted_models = []
+    revoked_models = []
+    blocked_models = []
+    notification_sent = False
+
+    if action_taken:
+        req_payload = json.dumps({
+            'run_id': run_id,
+            'candidates': added_cortex_base,
+            'disappeared': disappeared_active,
+            'repeats': 3,
+        })
+        req_hex = req_payload.encode('utf-8').hex()
+        job_name = f"<DB>.<SCHEMA>.SCOUT_JOB_{run_id}"
+        spec = (
+            "spec:\n"
+            "  containers:\n"
+            "  - name: scout\n"
+            "    image: <QUALIFICATION_IMAGE>\n"
+            "    mountSessionToken: true\n"
+            "    command:\n"
+            "    - python\n"
+            "    - -c\n"
+            f"    - \"import os, pathlib, runpy; os.setgroups([]) if os.geteuid()==0 else None; os.setgid(1000) if os.geteuid()==0 else None; os.setuid(1000) if os.geteuid()==0 else None; req=pathlib.Path('/artifacts/scouting/state/job_request_{run_id}.json'); req.parent.mkdir(parents=True, exist_ok=True); req.write_bytes(bytes.fromhex('{req_hex}')); os.environ['SCOUT_JOB_REQUEST']=str(req); os.environ['SCOUT_JOB_RESULT']='/artifacts/scouting/state/job_result_{run_id}.json'; runpy.run_path('/artifacts/scouting/spcs_scout_worker.py', run_name='__main__')\"\n"
+            "    resources:\n"
+            "      requests:\n"
+            "        cpu: \"0.20\"\n"
+            "        memory: \"512Mi\"\n"
+            "      limits:\n"
+            "        cpu: \"0.50\"\n"
+            "        memory: \"1Gi\"\n"
+            "    volumeMounts:\n"
+            "    - name: artifacts\n"
+            "      mountPath: /artifacts\n"
+            "  volumes:\n"
+            "  - name: artifacts\n"
+            "    source: stage\n"
+            "    uid: 1000\n"
+            "    gid: 1000\n"
+            "    stageConfig:\n"
+            "      name: \"<ARTIFACTS_STAGE>\"\n"
+        )
+        spec_hex = spec.encode('utf-8').hex()
+        spec_decoded = session.sql(f"SELECT HEX_DECODE_STRING('{spec_hex}') AS S").collect()[0]['S']
+        session.sql(f"EXECUTE JOB SERVICE IN COMPUTE POOL <COMPUTE_POOL> NAME={job_name} FROM SPECIFICATION '{spec_decoded}'").collect()
+        tested_models = added_cortex_base
+
+    md_lines = [
+        f"# Daily Model Scouting & Promotion Report — `{run_id}`",
+        f"- **Timestamp (UTC):** `{now_dt.isoformat()}`",
+        f"- **Baseline:** `{prev_source}` (`{len(prev_map)}` models) -> **Today:** `{len(curr_map)}` models",
+        f"- **New CORTEX_BASE:** `{len(added_cortex_base)}` ({added_cortex_base})",
+        f"- **Disappeared Models:** `{len(removed_all)}` ({removed_all})",
+        f"- **Revoked Active Models:** `{len(disappeared_active)}` ({disappeared_active})",
+        f"- **Action Taken:** `{action_taken}`",
+    ]
+    md_text = "\n".join(md_lines)
+
+    if action_taken:
+        subj = f"[Cortex Model Scout] Run {run_id}: {len(added_cortex_base)} new models detected, {len(disappeared_active)} removed"
+        html_body = (
+            "<html><body style='font-family:sans-serif;'>"
+            "<h2>Snowflake Cortex Proxy — Model Scouting &amp; Promotion Alert</h2>"
+            f"<pre>{html.escape(md_text)}</pre>"
+            "</body></html>"
+        )
+        subj_hex = subj.encode('utf-8').hex()
+        html_hex = html_body.encode('utf-8').hex()
+        session.sql(f"""
+            CALL SYSTEM$SEND_SNOWFLAKE_NOTIFICATION(
+                SNOWFLAKE.NOTIFICATION.TEXT_HTML(HEX_DECODE_STRING('{html_hex}')),
+                SNOWFLAKE.NOTIFICATION.EMAIL_INTEGRATION_CONFIG(
+                    '<EMAIL_INTEGRATION>',
+                    HEX_DECODE_STRING('{subj_hex}'),
+                    ARRAY_CONSTRUCT('<RECIPIENT_EMAIL>')
+                )
+            )
+        """).collect()
+        notification_sent = True
+
+    snap_doc = {'captured_at': now_dt.isoformat(), 'models': curr_models}
+    snap_hex = json.dumps(snap_doc).encode('utf-8').hex()
+    cortex_base_cnt = sum(1 for m in curr_models if str(m.get('model_type', '')).upper() == 'CORTEX_BASE')
+
+    session.sql(f"""
+        INSERT INTO <DB>.<SCHEMA>.MODEL_SNAPSHOT_HISTORY (
+            SNAPSHOT_ID, CAPTURED_AT, TOTAL_MODELS, CORTEX_BASE_MODELS, MODELS_JSON
+        )
+        SELECT '{run_id}', CURRENT_TIMESTAMP(), {len(curr_models)}, {cortex_base_cnt}, PARSE_JSON(HEX_DECODE_STRING('{snap_hex}'))
+    """).collect()
+
+    report_obj = {
+        'run_id': run_id,
+        'run_timestamp': now_dt.isoformat(),
+        'previous_snapshot_source': prev_source,
+        'prev_model_count': len(prev_map),
+        'curr_model_count': len(curr_map),
+        'added_cortex_base': added_cortex_base,
+        'removed_all': removed_all,
+        'disappeared_active': disappeared_active,
+        'action_taken': action_taken,
+        'notification_sent': notification_sent,
+        'active_catalog_by_channel': active_cat,
+    }
+    rep_hex = json.dumps(report_obj).encode('utf-8').hex()
+    md_hex = md_text.encode('utf-8').hex()
+    src_hex = prev_source.encode('utf-8').hex()
+    added_hex = json.dumps(added_cortex_base).encode('utf-8').hex()
+    rem_hex = json.dumps(removed_all).encode('utf-8').hex()
+    test_hex = json.dumps(tested_models).encode('utf-8').hex()
+    prom_hex = json.dumps(promoted_models).encode('utf-8').hex()
+    rev_hex = json.dumps(revoked_models).encode('utf-8').hex()
+    blk_hex = json.dumps(blocked_models).encode('utf-8').hex()
+    cat_hex = json.dumps(active_cat).encode('utf-8').hex()
+
+    session.sql(f"""
+        INSERT INTO <DB>.<SCHEMA>.MODEL_SCOUTING_RUNS (
+            RUN_ID, RUN_TIMESTAMP, PREVIOUS_SNAPSHOT_SOURCE, PREV_MODEL_COUNT, CURR_MODEL_COUNT,
+            ADDED_MODELS, REMOVED_MODELS, TESTED_MODELS, PROMOTED_MODELS, REVOKED_MODELS, BLOCKED_MODELS,
+            ACTIVE_CATALOG_BY_CHANNEL, CONSUMER_SYNC_STATUS, ACTION_TAKEN, NOTIFICATION_SENT, REPORT_MARKDOWN, REPORT_JSON
+        )
+        SELECT
+            '{run_id}',
+            CURRENT_TIMESTAMP(),
+            HEX_DECODE_STRING('{src_hex}'),
+            {len(prev_map)},
+            {len(curr_map)},
+            PARSE_JSON(HEX_DECODE_STRING('{added_hex}')),
+            PARSE_JSON(HEX_DECODE_STRING('{rem_hex}')),
+            PARSE_JSON(HEX_DECODE_STRING('{test_hex}')),
+            PARSE_JSON(HEX_DECODE_STRING('{prom_hex}')),
+            PARSE_JSON(HEX_DECODE_STRING('{rev_hex}')),
+            PARSE_JSON(HEX_DECODE_STRING('{blk_hex}')),
+            PARSE_JSON(HEX_DECODE_STRING('{cat_hex}')),
+            OBJECT_CONSTRUCT('status', 'OK'),
+            {str(action_taken).upper()},
+            {str(notification_sent).upper()},
+            HEX_DECODE_STRING('{md_hex}'),
+            PARSE_JSON(HEX_DECODE_STRING('{rep_hex}'))
+    """).collect()
+
+    return report_obj
+$$;
+
+CREATE OR REPLACE TASK <DB>.<SCHEMA>.DAILY_MODEL_SCOUT_TASK
+    WAREHOUSE = <WAREHOUSE>
+    SCHEDULE = 'USING CRON 30 7 * * * UTC'
+    COMMENT = 'Daily Cortex Model Scouting, Multi-Channel Qualification, Promotion & Removal'
+AS
+    CALL <DB>.<SCHEMA>.RUN_DAILY_MODEL_SCOUT();

@@ -107,6 +107,18 @@ class Publisher:
         if path.name != identifier + ".json":
             raise ValueError("Publication request is not content addressed")
         package = strict_json(raw)
+        if set(package) == {"revoke"} and isinstance(package["revoke"], dict):
+            req = package["revoke"]
+            if (set(req) != {"account", "approver", "expected_revision", "id", "issued_at", "method", "reason"} or
+                    req["method"] != "administrative-standard-v1" or
+                    req["account"] != self.registry.trust.account or
+                    req["approver"] not in self.registry.trust.admin_approvers or
+                    not isinstance(req["id"], str) or not req["id"] or
+                    not isinstance(req["reason"], str) or not req["reason"]):
+                raise ValueError("Invalid administrative revocation package")
+            revision = self.registry.revoke(req["id"], req["expected_revision"], operator=req["approver"])
+            self.checkpoint(self.registry.read())
+            return revision
         if set(package) != {"entry", "bundle"} or not isinstance(package["bundle"], list):
             raise ValueError("Invalid publication package")
         entry = Entry.model_validate(package["entry"])
