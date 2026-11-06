@@ -33,7 +33,7 @@ When `ProfileV2.normalize_client_options = True`, the proxy transparently normal
    - Clamps out-of-domain `reasoning.effort` values (e.g. `"none"` / `"minimal"` -> `"low"`) and `reasoning.summary` values to the profile's declared enum domain.
    - Enables `response_stream = "ordered-items"` (`stream_order.py` + `protocol.py`), reordering interleaved SSE events, accepting empty or provisional `encrypted_content` on `response.output_item.added`, verifying final `encrypted_content` equality between `response.output_item.done` and `response.completed`, and backfilling `response.output_item.added` so `langchain-openai`, `Langflow`, `Hermes`, and `n8n` receive the finalized opaque payload cleanly.
 3. **Chat Protocol Adjustments:**
-   - Resolves conflicts when a client sends both `max_tokens` and `max_completion_tokens`.
+   - Converts `max_tokens` to `max_completion_tokens` when `max_completion_tokens` is absent (`rename-max-tokens-to-completion`), and resolves conflicts when a client sends both (`dedup-max-tokens`).
    - Sets `reasoning_effort = "none"` when required by a profile (even if the client sends `"medium"` or omits it), and removes `reasoning_effort` on Chat models that do not support it.
 4. **Messages Protocol Adjustments:**
    - When `thinking.type` is outside the profile's supported enum (for example `"adaptive"` sent by clients before profile negotiation), strips the unsupported `thinking` block and paired `output_config.effort` instead of failing with `HTTP 400`.

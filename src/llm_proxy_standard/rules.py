@@ -140,6 +140,11 @@ def _normalize_client_body(body, profile):
             old = effective.pop("max_tokens")
             changes.append({"id": "dedup-max-tokens", "path": "max_tokens", "requested": old, "was_missing": False,
                             "effective": None, "removed": True, "reason": "Prefer max_completion_tokens", "effects": "Resolved token limit conflict"})
+        elif "max_tokens" in effective and "max_completion_tokens" not in effective and "max_completion_tokens" in profile.constraints:
+            old = effective.pop("max_tokens")
+            effective["max_completion_tokens"] = old
+            changes.append({"id": "rename-max-tokens-to-completion", "path": "max_tokens", "requested": old, "was_missing": False,
+                            "effective": old, "removed": True, "reason": "Prefer max_completion_tokens", "effects": "Converted max_tokens to max_completion_tokens"})
         for tok_field in ("max_tokens", "max_completion_tokens"):
             if tok_field in effective and type(effective[tok_field]) is int and tok_field in profile.constraints:
                 c = profile.constraints[tok_field]

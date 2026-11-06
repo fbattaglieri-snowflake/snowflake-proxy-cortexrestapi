@@ -25,6 +25,10 @@
 > ### FREE & OPEN-SOURCE LICENSE (MIT)
 > This project is released under the permissive **[MIT License](LICENSE)** (**100% free and open-source**). You are free to **use, copy, modify, fork, integrate, and deploy** it in personal, internal, or commercial environments without royalty or licensing restrictions.
 
+> [!NOTE]
+> ### COMPANION REPOSITORY — CORTEX AI GATEWAY EDITION
+> Looking to route your SPCS LLM proxy through **Snowflake Cortex AI Gateway** (`/api/v2/aigateways/snowflake/v1`) with native OpenTelemetry server spans (`TABLE(AGENT_TRACE_TABLE('SNOWFLAKE'))`), OTLP client trace pass-through (`POST /telemetry/v1/traces`), `AI_GATEWAY_USAGE_HISTORY` attribution, and per-user token quotas? See the companion repository: **[`snowflake-proxy-cortex-aigateway`](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortex-aigateway)**. Both repositories are maintained in lockstep.
+
 ---
 
 ## Table of Contents

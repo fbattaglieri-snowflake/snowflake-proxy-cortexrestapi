@@ -257,6 +257,15 @@ class MultiRoundTests(unittest.IsolatedAsyncioTestCase):
         eff_grok, _ = prepare({**raw_chat, 'model': 'grok-4.7'}, grok)
         self.assertNotIn('reasoning_effort', eff_grok)
 
+        eff_luna_max_tok_only, changes_mt = prepare({
+            'model': 'openai-gpt-6-luna',
+            'messages': [{'role': 'user', 'content': 'hi'}],
+            'max_tokens': 512,
+        }, luna)
+        self.assertNotIn('max_tokens', eff_luna_max_tok_only)
+        self.assertEqual(eff_luna_max_tok_only['max_completion_tokens'], 512)
+        self.assertTrue(any(c['id'] == 'rename-max-tokens-to-completion' for c in changes_mt))
+
         # 2. Responses normalization (n8n store=True, missing include, extra temperature)
         astra = build_universal_profile('openai-gpt-6-astra', 'responses', artifact)
         self.assertEqual(astra.response_stream, 'ordered-items')
