@@ -239,12 +239,13 @@ def _normalize_client_body(body, profile):
                     changes.append({"id": "strip-orphan-output-config", "path": "output_config", "requested": old_oc, "was_missing": False,
                                     "effective": None, "removed": True, "reason": "Adaptive effort paired with unsupported thinking mode", "effects": "Removed output_config.effort"})
                 thinking = None
-        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        if (isinstance(thinking, dict) and thinking.get("type") == "enabled") or "reasoning" in profile.capabilities:
             for temp_field in ("temperature", "top_p"):
                 if temp_field in effective:
                     old = effective.pop(temp_field)
                     changes.append({"id": f"strip-{temp_field}-thinking", "path": temp_field, "requested": old, "was_missing": False,
                                     "effective": None, "removed": True, "reason": "Thinking requires unset sampling parameters", "effects": f"Removed {temp_field}"})
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
             budget = thinking.get("budget_tokens")
             if type(budget) is int and type(effective.get("max_tokens")) is int and effective["max_tokens"] <= budget:
                 old = effective["max_tokens"]

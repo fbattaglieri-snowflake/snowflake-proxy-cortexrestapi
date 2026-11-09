@@ -103,12 +103,17 @@ class OptionTests(unittest.TestCase):
             "model": msg_prof.id,
             "messages": [{"role": "user", "content": "x" * (2 * 1024 * 1024)}],
             "max_tokens": 2048,
+            "temperature": 0.3,
+            "top_p": 0.9,
             "thinking": {"type": "adaptive", "display": "summarized"},
             "output_config": {"effort": "medium"},
         }, msg_prof)
         self.assertNotIn("thinking", eff)
         self.assertNotIn("output_config", eff)
+        self.assertNotIn("temperature", eff)
+        self.assertNotIn("top_p", eff)
         self.assertTrue(any(c["id"] == "strip-unsupported-thinking-type" for c in changes))
+        self.assertTrue(any(c["id"] == "strip-temperature-thinking" for c in changes))
         resp_data = flexible("responses", capabilities=["text", "reasoning"]).document()
         resp_data["normalize_client_options"] = True
         resp_data["constraints"].update({
