@@ -35,8 +35,11 @@ from model_probe.campaign import Campaign
 from model_probe.transport import Transport
 
 ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "EXAMPLE_ACCOUNT")
-HOST = os.environ.get("SNOWFLAKE_HOST", "example-account.snowflakecomputing.com")
-UPSTREAM = f"https://{HOST}/api/v2/cortex/v1"
+HOST = os.environ.get("SNOWFLAKE_HOST", "example-account.snowflakecomputing.com").replace("_", "-")
+GATEWAY_NAME = os.environ.get("PROXY_GATEWAY_NAME", "snowflake").strip()
+CORTEX_UPSTREAM = f"https://{HOST}/api/v2/cortex/v1"
+GATEWAY_UPSTREAM = f"https://{HOST}/api/v2/aigateways/{GATEWAY_NAME}/v1"
+UPSTREAM = os.environ.get("PROXY_UPSTREAM_URL", CORTEX_UPSTREAM)
 ARTIFACT_DIGEST = os.environ.get("PROXY_ARTIFACT_DIGEST", "0" * 64)
 APPROVER = os.environ.get("PROXY_ADMIN_APPROVER", "operator-admin")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://standard-model-registry.namespace.svc.spcs.internal:8090")
@@ -114,7 +117,7 @@ def build_profile_v2(
     )
 
 
-def fast_probe_oauth(model_id: str, protocol: str, reasoning: str | None = None) -> dict:
+def fast_probe_oauth(model_id: str, protocol: str, reasoning: str | None = None, upstream_url: str = UPSTREAM) -> dict:
     token = TOKEN_FILE.read_text().strip()
     if protocol == "chat":
         path = "/chat/completions"
@@ -147,7 +150,7 @@ def fast_probe_oauth(model_id: str, protocol: str, reasoning: str | None = None)
     }
     if protocol == "messages":
         headers["anthropic-version"] = "2023-06-01"
-    req = urllib.request.Request(UPSTREAM + path, data=json.dumps(body).encode(), headers=headers, method="POST")
+    req = urllib.request.Request(upstream_url + path, data=json.dumps(body).encode(), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=45) as resp:
             return {"protocol": protocol, "reasoning": reasoning, "reachable": True, "http_status": resp.status}
@@ -184,6 +187,7 @@ def main() -> None:
     tested = []
     promoted = []
     revoked = []
+    blocked = []
 
     for model_id in candidates:
         low = model_id.lower()
@@ -197,17 +201,30 @@ def main() -> None:
         chosen = None
         preflight = []
         for proto, reas in order:
-            pr = fast_probe_oauth(model_id, proto, reas)
+            pr = fast_probe_oauth(model_id, proto, reas, UPSTREAM)
             preflight.append(pr)
             if pr.get("reachable"):
                 chosen = (proto, reas)
                 break
 
         if not chosen:
-            tested.append({"model": model_id, "status": "PROFILE_BLOCKED", "promotable": False, "preflight": preflight})
+            rec = {
+                "model": model_id,
+                "status": "PROFILE_BLOCKED",
+                "promotable": False,
+                "reason": "Rejected by all candidate channels (messages, chat, responses) at preflight.",
+                "preflight": preflight,
+            }
+            tested.append(rec)
+            blocked.append(rec)
             continue
 
         proto, reas = chosen
+        companion_url = CORTEX_UPSTREAM if UPSTREAM == GATEWAY_UPSTREAM else GATEWAY_UPSTREAM
+        companion_probe = fast_probe_oauth(model_id, proto, reas, companion_url)
+        gateway_reachable = True if UPSTREAM == GATEWAY_UPSTREAM else bool(companion_probe.get("reachable"))
+        cortex_rest_reachable = True if UPSTREAM == CORTEX_UPSTREAM else bool(companion_probe.get("reachable"))
+
         transport = Transport(UPSTREAM, HOST, token_file=str(TOKEN_FILE), auth_type="OAUTH")
         out_dir = Path("/tmp") / f"qualify_{model_id}_{proto}"
         campaign = Campaign(
@@ -238,25 +255,28 @@ def main() -> None:
         }
         core_rows = [r for r in results if (r.get("name") or r.get("case")) in core_cases]
         full_suite_ok = summary.get("status") == "PROFILE_QUALIFIED"
-        core_ok = full_suite_ok or (
+        core_ok = (full_suite_ok or (
             len(core_rows) == len(core_cases) * repeats and all(r.get("status") == "PASS" for r in core_rows)
-        )
+        )) and gateway_reachable and cortex_rest_reachable
         struct_rows = [r for r in results if (r.get("name") or r.get("case")) in {"structured", "structured_negative"}]
         struct_ok = full_suite_ok or (
             len(struct_rows) == 2 * repeats and all(r.get("status") == "PASS" for r in struct_rows)
         )
 
-        tested.append(
-            {
-                "model": model_id,
-                "channel": proto,
-                "reasoning": reas,
-                "status": "PROFILE_QUALIFIED" if core_ok else "PROFILE_BLOCKED",
-                "promotable": core_ok,
-                "counts": summary.get("counts"),
-                "preflight": preflight,
-            }
-        )
+        rec = {
+            "model": model_id,
+            "channel": proto,
+            "reasoning": reas,
+            "status": "PROFILE_QUALIFIED" if core_ok else "PROFILE_BLOCKED",
+            "promotable": core_ok,
+            "cortex_rest_reachable": cortex_rest_reachable,
+            "ai_gateway_reachable": gateway_reachable,
+            "counts": summary.get("counts"),
+            "preflight": preflight,
+        }
+        tested.append(rec)
+        if not core_ok:
+            blocked.append(rec)
         if core_ok:
             caps = ["text", "tools", "parallel_tools", "streaming"]
             if struct_ok:
@@ -373,13 +393,14 @@ def main() -> None:
                 "tested": tested,
                 "promoted": promoted,
                 "revoked": revoked,
+                "blocked": blocked,
                 "expected_generation": working_doc.get("generation"),
                 "expected_revision": expected_rev,
             },
             indent=2,
         )
     )
-    print(json.dumps({"status": "COMPLETED", "promoted": len(promoted), "revoked": len(revoked)}))
+    print(json.dumps({"status": "COMPLETED", "promoted": len(promoted), "revoked": len(revoked), "blocked": len(blocked)}))
 
 
 if __name__ == "__main__":

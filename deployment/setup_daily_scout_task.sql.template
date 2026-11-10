@@ -1,5 +1,6 @@
 -- =============================================================================
 -- Automated Daily Cortex Model Scouting, Qualification, Promotion & Removal
+-- Synchronizes BOTH the SPCS LLM Proxy Registry AND Snowflake Cortex AI Gateway
 -- Replace placeholders (<DB>, <SCHEMA>, <WAREHOUSE>, <COMPUTE_POOL>,
 -- <ARTIFACTS_STAGE>, <QUALIFICATION_IMAGE>, <EMAIL_INTEGRATION>, <RECIPIENT_EMAIL>)
 -- before executing with: snow sql --enable-templating NONE -f setup_daily_scout_task.sql
@@ -47,6 +48,7 @@ SELECT
     REVOKED_MODELS,
     BLOCKED_MODELS,
     ACTIVE_CATALOG_BY_CHANNEL,
+    CONSUMER_SYNC_STATUS,
     ACTION_TAKEN,
     NOTIFICATION_SENT,
     REPORT_MARKDOWN
@@ -64,12 +66,49 @@ AS
 $$
 import json
 import html
+import os
+import tempfile
 from datetime import datetime, timezone
+
+
+def _sync_ai_gateway(session, allowed_models, gateway_name='SNOWFLAKE'):
+    logging_block = (
+        "logging:\n"
+        "  enabled: true\n"
+        "  enable_client_telemetry: true\n"
+        "  capture_payload:\n"
+        "    request_response: true"
+    )
+    try:
+        desc_rows = session.sql(f"DESCRIBE AI GATEWAY {gateway_name}").collect()
+        if desc_rows:
+            curr_spec = str(desc_rows[0].as_dict().get('specification') or '')
+            if '\nlogging:\n' in curr_spec:
+                logging_block = 'logging:\n' + curr_spec.split('\nlogging:\n', 1)[1].strip('\n')
+    except Exception:
+        pass
+    models_lines = "\n".join(f"  - name: '{m}'" for m in sorted(set(allowed_models))) if allowed_models else "  - name: '*'"
+    spec_yaml = f"schema_version: 1\nmodels:\n{models_lines}\n{logging_block}"
+    spec_hex = spec_yaml.encode('utf-8').hex()
+    spec_decoded = session.sql(f"SELECT HEX_DECODE_STRING('{spec_hex}') AS S").collect()[0]['S']
+    delim = '$' * 2
+    session.sql(f"ALTER AI GATEWAY {gateway_name} FROM SPECIFICATION {delim}\n{spec_decoded}\n{delim}").collect()
+    return True
+
 
 def main(session):
     now_dt = datetime.now(timezone.utc)
     run_id = now_dt.strftime('%Y%m%d_%H%M%S')
 
+    # Step 1: Refresh account-level CORTEX_BASE models catalog (feeds both Cortex REST API and AI Gateway)
+    models_refreshed = False
+    try:
+        session.sql('CALL SNOWFLAKE.MODELS.CORTEX_BASE_MODELS_REFRESH()').collect()
+        models_refreshed = True
+    except Exception:
+        models_refreshed = False
+
+    # Step 2: Capture current SHOW MODELS IN ACCOUNT inventory
     curr_rows = session.sql('SHOW MODELS IN ACCOUNT').collect()
     curr_models = []
     curr_map = {}
@@ -125,9 +164,17 @@ def main(session):
     promoted_models = []
     revoked_models = []
     blocked_models = []
+    gateway_synced = False
     notification_sent = False
 
     if action_taken:
+        # Temporarily allow candidate models on AI Gateway during qualification
+        if added_cortex_base:
+            try:
+                _sync_ai_gateway(session, sorted(active_set | set(added_cortex_base)))
+            except Exception:
+                pass
+
         req_payload = json.dumps({
             'run_id': run_id,
             'candidates': added_cortex_base,
@@ -169,22 +216,56 @@ def main(session):
         session.sql(f"EXECUTE JOB SERVICE IN COMPUTE POOL <COMPUTE_POOL> NAME={job_name} FROM SPECIFICATION '{spec_decoded}'").collect()
         tested_models = added_cortex_base
 
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                session.file.get(f"<ARTIFACTS_STAGE>/scouting/state/job_result_{run_id}.json", tmp_dir)
+                res_file = os.path.join(tmp_dir, f"job_result_{run_id}.json")
+                if os.path.exists(res_file):
+                    with open(res_file, 'r') as f:
+                        job_res = json.load(f)
+                    promoted_models = job_res.get('promoted', [])
+                    revoked_models = job_res.get('revoked', [])
+                    blocked_models = job_res.get('blocked', [t for t in job_res.get('tested', []) if not t.get('promotable')])
+                    for p in promoted_models:
+                        ch = p.get('protocol')
+                        m_id = p.get('model')
+                        if ch in active_cat and m_id and m_id not in active_cat[ch]:
+                            active_cat[ch].append(m_id)
+                            active_cat[ch].sort()
+                    for r in revoked_models:
+                        m_id = r.get('model')
+                        for ch_list in active_cat.values():
+                            if m_id in ch_list:
+                                ch_list.remove(m_id)
+        except Exception:
+            pass
+
+    all_active = sorted(set(active_cat.get('messages', [])) | set(active_cat.get('chat', [])) | set(active_cat.get('responses', [])))
+    try:
+        gateway_synced = _sync_ai_gateway(session, all_active)
+    except Exception:
+        gateway_synced = False
+
     md_lines = [
         f"# Daily Model Scouting & Promotion Report — `{run_id}`",
         f"- **Timestamp (UTC):** `{now_dt.isoformat()}`",
+        f"- **`CORTEX_BASE_MODELS_REFRESH()`:** `{models_refreshed}`",
+        f"- **`AI GATEWAY SNOWFLAKE` Synced:** `{gateway_synced}` (`{len(all_active)}` allowed models)",
         f"- **Baseline:** `{prev_source}` (`{len(prev_map)}` models) -> **Today:** `{len(curr_map)}` models",
         f"- **New CORTEX_BASE:** `{len(added_cortex_base)}` ({added_cortex_base})",
+        f"- **Promoted Models:** `{len(promoted_models)}` ({[p.get('model') for p in promoted_models]})",
+        f"- **Blocked Models:** `{len(blocked_models)}` ({[b.get('model') for b in blocked_models]})",
         f"- **Disappeared Models:** `{len(removed_all)}` ({removed_all})",
-        f"- **Revoked Active Models:** `{len(disappeared_active)}` ({disappeared_active})",
+        f"- **Revoked Active Models:** `{len(revoked_models)}` ({[r.get('model') for r in revoked_models]})",
         f"- **Action Taken:** `{action_taken}`",
     ]
     md_text = "\n".join(md_lines)
 
     if action_taken:
-        subj = f"[Cortex Model Scout] Run {run_id}: {len(added_cortex_base)} new models detected, {len(disappeared_active)} removed"
+        subj = f"[Cortex Model Scout] Run {run_id}: {len(promoted_models)} promoted, {len(revoked_models)} removed, {len(blocked_models)} blocked"
         html_body = (
             "<html><body style='font-family:sans-serif;'>"
-            "<h2>Snowflake Cortex Proxy — Model Scouting &amp; Promotion Alert</h2>"
+            "<h2>Snowflake Cortex Proxy &amp; AI Gateway — Model Scouting &amp; Promotion Alert</h2>"
             f"<pre>{html.escape(md_text)}</pre>"
             "</body></html>"
         )
@@ -202,7 +283,7 @@ def main(session):
         """).collect()
         notification_sent = True
 
-    snap_doc = {'captured_at': now_dt.isoformat(), 'models': curr_models}
+    snap_doc = {'captured_at': now_dt.isoformat(), 'cortex_base_models_refreshed': models_refreshed, 'models': curr_models}
     snap_hex = json.dumps(snap_doc).encode('utf-8').hex()
     cortex_base_cnt = sum(1 for m in curr_models if str(m.get('model_type', '')).upper() == 'CORTEX_BASE')
 
@@ -213,18 +294,31 @@ def main(session):
         SELECT '{run_id}', CURRENT_TIMESTAMP(), {len(curr_models)}, {cortex_base_cnt}, PARSE_JSON(HEX_DECODE_STRING('{snap_hex}'))
     """).collect()
 
+    sync_obj = {
+        'status': 'OK',
+        'cortex_base_models_refreshed': models_refreshed,
+        'proxy_registry_updated': bool(promoted_models or revoked_models),
+        'ai_gateway_synced': gateway_synced,
+        'ai_gateway_allowed_models_count': len(all_active),
+    }
     report_obj = {
         'run_id': run_id,
         'run_timestamp': now_dt.isoformat(),
+        'cortex_base_models_refreshed': models_refreshed,
+        'ai_gateway_synced': gateway_synced,
         'previous_snapshot_source': prev_source,
         'prev_model_count': len(prev_map),
         'curr_model_count': len(curr_map),
         'added_cortex_base': added_cortex_base,
         'removed_all': removed_all,
         'disappeared_active': disappeared_active,
+        'promoted_models': promoted_models,
+        'revoked_models': revoked_models,
+        'blocked_models': blocked_models,
         'action_taken': action_taken,
         'notification_sent': notification_sent,
         'active_catalog_by_channel': active_cat,
+        'consumer_sync': sync_obj,
     }
     rep_hex = json.dumps(report_obj).encode('utf-8').hex()
     md_hex = md_text.encode('utf-8').hex()
@@ -236,6 +330,7 @@ def main(session):
     rev_hex = json.dumps(revoked_models).encode('utf-8').hex()
     blk_hex = json.dumps(blocked_models).encode('utf-8').hex()
     cat_hex = json.dumps(active_cat).encode('utf-8').hex()
+    sync_hex = json.dumps(sync_obj).encode('utf-8').hex()
 
     session.sql(f"""
         INSERT INTO <DB>.<SCHEMA>.MODEL_SCOUTING_RUNS (
@@ -256,7 +351,7 @@ def main(session):
             PARSE_JSON(HEX_DECODE_STRING('{rev_hex}')),
             PARSE_JSON(HEX_DECODE_STRING('{blk_hex}')),
             PARSE_JSON(HEX_DECODE_STRING('{cat_hex}')),
-            OBJECT_CONSTRUCT('status', 'OK'),
+            PARSE_JSON(HEX_DECODE_STRING('{sync_hex}')),
             {str(action_taken).upper()},
             {str(notification_sent).upper()},
             HEX_DECODE_STRING('{md_hex}'),
@@ -269,6 +364,6 @@ $$;
 CREATE OR REPLACE TASK <DB>.<SCHEMA>.DAILY_MODEL_SCOUT_TASK
     WAREHOUSE = <WAREHOUSE>
     SCHEDULE = 'USING CRON 30 7 * * * UTC'
-    COMMENT = 'Daily Cortex Model Scouting, Multi-Channel Qualification, Promotion & Removal'
+    COMMENT = 'Daily Cortex Model Scouting, Multi-Channel Qualification, Promotion & Removal (Proxy + AI Gateway)'
 AS
     CALL <DB>.<SCHEMA>.RUN_DAILY_MODEL_SCOUT();

@@ -50,7 +50,13 @@ from promote_model import (
 class ScoutConfig:
     def __init__(self, args: argparse.Namespace) -> None:
         self.account: str = args.account or os.environ.get("SNOWFLAKE_ACCOUNT", "EXAMPLE_ACCOUNT")
-        self.host: str = args.host or os.environ.get("SNOWFLAKE_HOST", "example-account.snowflakecomputing.com")
+        raw_host = args.host or os.environ.get("SNOWFLAKE_HOST", "example-account.snowflakecomputing.com")
+        self.host: str = raw_host.replace("_", "-")
+        self.gateway_name: str = (
+            getattr(args, "gateway_name", None) or os.environ.get("PROXY_GATEWAY_NAME", "snowflake")
+        ).strip()
+        env_sync = os.environ.get("SNOWFLAKE_SYNC_GATEWAY_SPEC", "true").lower()
+        self.sync_gateway_spec: bool = not bool(getattr(args, "no_sync_gateway", False)) and env_sync not in {"0", "false"}
         self.connection: str | None = args.connection or os.environ.get("SNOWFLAKE_CONNECTION")
         self.stage: str = (args.stage or os.environ.get("SNOWFLAKE_STAGE", "@LLM_PROXY_DB.CORE.LLM_PROXY_ARTIFACTS")).rstrip("/")
         self.inbox_prefix: str = (args.inbox_prefix or os.environ.get("SNOWFLAKE_INBOX_PREFIX", "inbox")).strip("/")
@@ -74,8 +80,20 @@ class ScoutConfig:
         self.force_models: list[str] = list(args.force_models or [])
 
     @property
-    def upstream_url(self) -> str:
+    def cortex_upstream_url(self) -> str:
         return f"https://{self.host}/api/v2/cortex/v1"
+
+    @property
+    def gateway_upstream_url(self) -> str:
+        return f"https://{self.host}/api/v2/aigateways/{self.gateway_name}/v1"
+
+    @property
+    def upstream_url(self) -> str:
+        return self.cortex_upstream_url
+
+    @property
+    def companion_upstream_url(self) -> str:
+        return self.gateway_upstream_url
 
 
 def run_snow_sql(query: str, connection: str | None = None) -> Any:
@@ -101,6 +119,12 @@ def load_auth_token() -> tuple[str, str]:
 
 
 def fetch_current_account_inventory(cfg: ScoutConfig) -> dict[str, Any]:
+    refreshed = False
+    try:
+        run_snow_sql("CALL SNOWFLAKE.MODELS.CORTEX_BASE_MODELS_REFRESH()", cfg.connection)
+        refreshed = True
+    except Exception:
+        refreshed = False
     ctx_rows = run_snow_sql(
         "SELECT CURRENT_ACCOUNT() AS ACCOUNT, CURRENT_REGION() AS REGION, CURRENT_ROLE() AS ROLE, CURRENT_USER() AS USER",
         cfg.connection,
@@ -110,8 +134,38 @@ def fetch_current_account_inventory(cfg: ScoutConfig) -> dict[str, Any]:
     return {
         "captured_at": utcnow().isoformat(),
         "host": cfg.host,
+        "cortex_base_models_refreshed": refreshed,
         "context": identity,
         "models": models if isinstance(models, list) else [],
+    }
+
+
+def sync_ai_gateway_specification(cfg: ScoutConfig, allowed_models: list[str]) -> dict[str, Any]:
+    """Synchronize `ALTER AI GATEWAY <NAME> FROM SPECIFICATION` `models:` allowlist while preserving logging."""
+    gw_ident = re.sub(r"[^A-Za-z0-9_]", "", cfg.gateway_name).upper() or "SNOWFLAKE"
+    logging_block = (
+        "logging:\n"
+        "  enabled: true\n"
+        "  enable_client_telemetry: true\n"
+        "  capture_payload:\n"
+        "    request_response: true"
+    )
+    try:
+        desc_rows = run_snow_sql(f"DESCRIBE AI GATEWAY {gw_ident}", cfg.connection)
+        if isinstance(desc_rows, list) and desc_rows and isinstance(desc_rows[0], dict):
+            curr_spec = str(desc_rows[0].get("specification") or "")
+            if "\nlogging:\n" in curr_spec:
+                logging_block = "logging:\n" + curr_spec.split("\nlogging:\n", 1)[1].strip("\n")
+    except Exception:
+        pass
+    models_lines = "\n".join(f"  - name: '{m}'" for m in sorted(set(allowed_models))) if allowed_models else "  - name: '*'"
+    spec_yaml = f"schema_version: 1\nmodels:\n{models_lines}\n{logging_block}"
+    run_snow_sql(f"ALTER AI GATEWAY {gw_ident} FROM SPECIFICATION $$\n{spec_yaml}\n$$", cfg.connection)
+    return {
+        "gateway_name": gw_ident,
+        "synced": True,
+        "allowed_models_count": len(allowed_models),
+        "allowed_models": sorted(set(allowed_models)),
     }
 
 
@@ -409,6 +463,7 @@ def scout_and_qualify_new_model(
         }
 
     proto, reas = chosen
+    companion_probe = fast_channel_probe(cfg.companion_upstream_url, token, auth_type, model_id, proto, reasoning=reas)
     qual = qualify_model_on_channel(cfg, token, auth_type, model_id, proto, reas, run_dir)
     supports_re_effort = False
     if proto == "chat" and reas is None and qual.get("promotable"):
@@ -416,20 +471,24 @@ def scout_and_qualify_new_model(
             fast_channel_probe(cfg.upstream_url, token, auth_type, model_id, "chat", reasoning="low").get("reachable")
         )
     qual["supports_reasoning_effort"] = supports_re_effort
+    both_upstreams_ok = bool(qual.get("promotable")) and bool(companion_probe.get("reachable"))
 
     return {
         "model": model_id,
-        "status": "PROFILE_QUALIFIED" if qual.get("promotable") else "PROFILE_BLOCKED",
-        "promotable": qual.get("promotable", False),
+        "status": "PROFILE_QUALIFIED" if both_upstreams_ok else "PROFILE_BLOCKED",
+        "promotable": both_upstreams_ok,
         "channel": proto,
         "reasoning": reas,
         "supports_reasoning_effort": supports_re_effort,
+        "cortex_rest_reachable": True if cfg.upstream_url == cfg.cortex_upstream_url else bool(companion_probe.get("reachable")),
+        "ai_gateway_reachable": True if cfg.upstream_url == cfg.gateway_upstream_url else bool(companion_probe.get("reachable")),
         "reason": (
-            f"Qualified on channel '{proto}' ({qual['counts'].get('PASS', 0)} PASS / {qual['counts'].get('FAIL', 0)} FAIL)"
-            if qual.get("promotable")
-            else f"Blocked on channel '{proto}' ({qual['counts'].get('PASS', 0)} PASS / {qual['counts'].get('FAIL', 0)} FAIL)"
+            f"Qualified on channel '{proto}' across Cortex REST & AI Gateway ({qual['counts'].get('PASS', 0)} PASS / {qual['counts'].get('FAIL', 0)} FAIL)"
+            if both_upstreams_ok
+            else f"Blocked on channel '{proto}' ({qual['counts'].get('PASS', 0)} PASS / {qual['counts'].get('FAIL', 0)} FAIL, companion_reachable={companion_probe.get('reachable')})"
         ),
         "preflight": preflight_results,
+        "companion_preflight": companion_probe,
         "qualification": qual,
     }
 
@@ -604,6 +663,8 @@ def format_run_markdown(report: dict[str, Any]) -> str:
         "",
         f"- **Timestamp (UTC):** `{ts}`",
         f"- **Target Account:** `{report['account']}`",
+        f"- **`CORTEX_BASE_MODELS_REFRESH()` Executed:** `{report.get('cortex_base_models_refreshed', True)}`",
+        f"- **`AI GATEWAY` Allowlist Synchronized:** `{report.get('gateway_spec_synced', False)}` (`{report.get('gateway_name', 'snowflake').upper()}`)",
         f"- **Snapshot Diff:** `{diff['previous_total_models']}` models -> `{diff['current_total_models']}` models",
         f"- **Action Taken (`action_taken`):** `{report['action_taken']}`",
         f"- **Notification Sent (`notification_sent`):** `{report.get('notification_sent', False)}`",
@@ -669,6 +730,8 @@ def build_notification_html(report: dict[str, Any]) -> str:
   <p>
     <strong>Run ID:</strong> <code>{run_id}</code><br/>
     <strong>Timestamp (UTC):</strong> <code>{ts}</code><br/>
+    <strong>CORTEX_BASE_MODELS_REFRESH():</strong> <code>{report.get('cortex_base_models_refreshed', True)}</code><br/>
+    <strong>AI Gateway Sync (<code>{html.escape(str(report.get('gateway_name', 'snowflake')).upper())}</code>):</strong> <code>{report.get('gateway_spec_synced', False)}</code><br/>
     <strong>Model Snapshot:</strong> {diff['previous_total_models']} &rarr; {diff['current_total_models']} total models<br/>
     <strong>Promoted Models:</strong> <strong>{html.escape(promoted_str)}</strong><br/>
     <strong>Revoked (Disappeared) Models:</strong> <strong>{html.escape(revoked_str)}</strong>
@@ -808,6 +871,8 @@ def run_daily_scouting(cfg: ScoutConfig) -> dict[str, Any]:
     blocked_items: list[dict[str, Any]] = []
 
     if models_to_test:
+        if cfg.sync_gateway_spec:
+            sync_ai_gateway_specification(cfg, sorted(active_set | set(models_to_test)))
         token, auth_type = load_auth_token()
         for m_id in models_to_test:
             outcome = scout_and_qualify_new_model(cfg, token, auth_type, m_id, run_dir)
@@ -851,11 +916,19 @@ def run_daily_scouting(cfg: ScoutConfig) -> dict[str, Any]:
             if r["model"] in ch_list:
                 ch_list.remove(r["model"])
 
+    all_active = sorted(set().union(*active_by_channel.values()))
+    gw_sync_info: dict[str, Any] = {"gateway_name": cfg.gateway_name.upper(), "synced": False}
+    if cfg.sync_gateway_spec and (models_to_test or promoted_records or revoked_records):
+        gw_sync_info = sync_ai_gateway_specification(cfg, all_active)
+
     action_taken = bool(tested_results or promoted_records or revoked_records)
     report: dict[str, Any] = {
         "run_id": run_id,
         "run_timestamp": now_dt.isoformat(),
         "account": cfg.account,
+        "cortex_base_models_refreshed": bool(current_inv.get("cortex_base_models_refreshed")),
+        "gateway_name": cfg.gateway_name,
+        "gateway_spec_synced": bool(gw_sync_info.get("synced")),
         "previous_snapshot_source": prev_source,
         "registry_generation": current_gen + len(promoted_records) + len(revoked_records),
         "registry_revision": (
@@ -877,6 +950,11 @@ def run_daily_scouting(cfg: ScoutConfig) -> dict[str, Any]:
         "revoked_models": revoked_records,
         "blocked_models": blocked_items,
         "active_catalog_by_channel": active_by_channel,
+        "consumer_sync": {
+            "cortex_base_models_refreshed": bool(current_inv.get("cortex_base_models_refreshed")),
+            "proxy_registry_updated": bool(promoted_records or revoked_records),
+            "ai_gateway": gw_sync_info,
+        },
     }
 
     md_text = format_run_markdown(report)
@@ -902,6 +980,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--account", default=None, help="Snowflake account locator")
     parser.add_argument("--host", default=None, help="Snowflake host (<org>-<account>.snowflakecomputing.com)")
+    parser.add_argument("--gateway-name", default=None, help="Snowflake Cortex AI Gateway name (default: snowflake)")
+    parser.add_argument("--sync-gateway-spec", action="store_true", help="Synchronize ALTER AI GATEWAY model allowlist on catalog change")
+    parser.add_argument("--no-sync-gateway", action="store_true", help="Disable ALTER AI GATEWAY synchronization")
     parser.add_argument("--connection", default=None, help="Snowflake CLI connection name")
     parser.add_argument("--stage", default=None, help="Snowflake stage FQN (e.g. @DB.SCHEMA.STAGE)")
     parser.add_argument("--inbox-prefix", default=None, help="Stage prefix for Registry inbox")
