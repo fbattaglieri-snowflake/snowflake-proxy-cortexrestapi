@@ -238,3 +238,27 @@ class HTTPOptionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("do-not-reflect", result.text)
             self.assertNotIn("secret-field-value", result.text)
             self.assertEqual(len(self.requests), 1)
+
+    async def test_v2_transient_upstream_429_is_retried(self):
+        import base64
+        import httpx
+        import json
+        data = flexible("messages", capabilities=["text", "reasoning"]).document()
+        data["normalize_client_options"] = True
+        value = ProfileV2.model_validate(data)
+        self.document = self.authority.snapshot(value).document()
+        self.document["generation"] = 2
+        self.cache.snapshot = None
+        self.assertTrue(await self.cache.refresh())
+        calls = []
+        def flaky_handler(request):
+            calls.append(request)
+            if len(calls) == 1:
+                return httpx.Response(429, headers={"retry-after": "0.01"}, json={"message": "Too Many Requests"})
+            return httpx.Response(200, json=test_app.output("messages"))
+        self.handler = flaky_handler
+        result = await self.http.post("/messages/v1/messages", json={**test_app.payload("messages"), "max_tokens": 2048})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(calls), 2)
+        adj = json.loads(base64.urlsafe_b64decode(result.headers["x-proxy-adjustments"] + "===").decode())
+        self.assertTrue(any(c["id"] == "upstream-rate-limit-retry" and c["requested"] == 429 for c in adj))

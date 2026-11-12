@@ -250,15 +250,37 @@ def create_app(settings, cache, *, transport=None):
                     current = cache.resolve(protocol, profile.id)
                     if current != profile:
                         raise Unavailable("Profile changed while waiting")
-                    token = settings.token_path.read_text().strip()
-                    if not token:
-                        raise OSError("Missing token")
-                    headers = {"Authorization": "Bearer " + token, "X-Snowflake-Authorization-Token-Type": "OAUTH",
-                               "Content-Type": "application/json", "Accept": "text/event-stream" if effective.get("stream") else "application/json"}
-                    if protocol == "messages":
-                        headers["anthropic-version"] = "2023-06-01"
-                    upstream = app.state.client.build_request("POST", settings.upstream + SUFFIX[protocol], json=effective, headers=headers)
-                    response = await until_disconnect(request, app.state.client.send(upstream, stream=True))
+                    retry_delays = (2.5, 6.0, 14.0, 25.0) if getattr(profile, "normalize_client_options", False) else ()
+                    prev_status = None
+                    for attempt_idx in range(len(retry_delays) + 1):
+                        token = settings.token_path.read_text().strip()
+                        if not token:
+                            raise OSError("Missing token")
+                        headers = {"Authorization": "Bearer " + token, "X-Snowflake-Authorization-Token-Type": "OAUTH",
+                                   "Content-Type": "application/json", "Accept": "text/event-stream" if effective.get("stream") else "application/json"}
+                        if protocol == "messages":
+                            headers["anthropic-version"] = "2023-06-01"
+                        upstream = app.state.client.build_request("POST", settings.upstream + SUFFIX[protocol], json=effective, headers=headers)
+                        response = await until_disconnect(request, app.state.client.send(upstream, stream=True))
+                        if response.status_code not in {429, 503, 529} or attempt_idx >= len(retry_delays):
+                            if attempt_idx > 0 and 200 <= response.status_code < 300:
+                                changes.append({"id": "upstream-rate-limit-retry", "path": "upstream", "requested": prev_status,
+                                                "was_missing": False, "effective": response.status_code, "removed": False,
+                                                "reason": "Transient upstream rate limit or overload", "effects": f"Retried {attempt_idx} time(s)"})
+                            break
+                        prev_status = response.status_code
+                        retry_after_raw = response.headers.get("retry-after") or response.headers.get("x-ratelimit-reset-requests")
+                        await response.aclose()
+                        response = None
+                        delay = retry_delays[attempt_idx]
+                        if retry_after_raw:
+                            try:
+                                delay = max(0.01, min(30.0, float(retry_after_raw)))
+                            except ValueError:
+                                pass
+                        if time.monotonic() + delay >= expires:
+                            return error(protocol, prev_status, f"Upstream HTTP {prev_status}; retry budget exceeded deadline", request_id)
+                        await until_disconnect(request, asyncio.sleep(delay))
                     if not 200 <= response.status_code < 300:
                         status = response.status_code if response.status_code >= 400 else 502
                         return error(protocol, status, f"Upstream HTTP {response.status_code}; no retry or fallback", request_id)
