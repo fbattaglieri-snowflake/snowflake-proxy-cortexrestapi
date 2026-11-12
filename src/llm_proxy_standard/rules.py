@@ -228,9 +228,31 @@ def _normalize_client_body(body, profile):
             old = effective["tool_choice"]
             effective["tool_choice"] = {"type": old}
         thinking = effective.get("thinking")
+        t_constraint = profile.constraints.get("thinking.type")
+        low_id = profile.id.lower()
+        is_adaptive_only = any(tag in low_id for tag in ("-5-", "-5.", "fable", "mythos", "-4-7", "-4.7", "-4-8", "-4.8")) or (
+            t_constraint is not None and t_constraint.kind == "enum" and t_constraint.values == ["adaptive"]
+        )
+        if thinking is None and is_adaptive_only and (t_constraint is None or t_constraint.accepts("adaptive")) and effective.get("max_tokens") == 2048:
+            effective["max_tokens"] = min(max_cap, 32768)
+            effective["thinking"] = {"type": "adaptive", "display": "summarized"}
+            thinking = effective["thinking"]
+            changes.append({"id": "upgrade-adaptive-max-tokens", "path": "max_tokens", "requested": 2048, "was_missing": False,
+                            "effective": effective["max_tokens"], "removed": False, "reason": "Mandatory adaptive thinking model requires >2048 max_tokens budget", "effects": "Increased max_tokens to 32768"})
+            oc_c = profile.constraints.get("output_config.effort")
+            if "output_config" not in effective and (oc_c is None or oc_c.accepts("medium")):
+                effective["output_config"] = {"effort": "medium"}
+                changes.append({"id": "default-adaptive-effort", "path": "output_config.effort", "requested": None, "was_missing": True,
+                                "effective": "medium", "removed": False, "reason": "Bound adaptive thinking effort", "effects": "Set output_config.effort=medium"})
+        requested_budget = thinking.get("budget_tokens") if isinstance(thinking, dict) and thinking.get("type") == "enabled" else None
         if isinstance(thinking, dict):
-            t_constraint = profile.constraints.get("thinking.type")
-            if t_constraint and not t_constraint.accepts(thinking.get("type")):
+            if is_adaptive_only and thinking.get("type") == "enabled" and (t_constraint is None or t_constraint.accepts("adaptive")):
+                old_t = copy.deepcopy(thinking)
+                effective["thinking"] = {"type": "adaptive"}
+                thinking = effective["thinking"]
+                changes.append({"id": "normalize-thinking-to-adaptive", "path": "thinking", "requested": old_t, "was_missing": False,
+                                "effective": {"type": "adaptive"}, "removed": False, "reason": "Model requires adaptive thinking", "effects": "Converted enabled thinking to adaptive"})
+            elif (is_adaptive_only and thinking.get("type") == "disabled") or (t_constraint and not t_constraint.accepts(thinking.get("type"))):
                 old_t = effective.pop("thinking")
                 changes.append({"id": "strip-unsupported-thinking-type", "path": "thinking", "requested": old_t, "was_missing": False,
                                 "effective": None, "removed": True, "reason": "Thinking mode not supported by profile", "effects": "Removed unsupported thinking block"})
@@ -239,17 +261,29 @@ def _normalize_client_body(body, profile):
                     changes.append({"id": "strip-orphan-output-config", "path": "output_config", "requested": old_oc, "was_missing": False,
                                     "effective": None, "removed": True, "reason": "Adaptive effort paired with unsupported thinking mode", "effects": "Removed output_config.effort"})
                 thinking = None
-        if (isinstance(thinking, dict) and thinking.get("type") == "enabled") or "reasoning" in profile.capabilities:
+                requested_budget = None
+            if isinstance(thinking, dict) and "display" in thinking and (thinking.get("type") != "adaptive" or thinking.get("display") not in {"summarized", "omitted"}):
+                old_disp = thinking.pop("display")
+                changes.append({"id": "strip-thinking-display", "path": "thinking.display", "requested": old_disp, "was_missing": False,
+                                "effective": None, "removed": True, "reason": "Unsupported thinking display hint", "effects": "Removed thinking.display"})
+        if isinstance(effective.get("output_config"), dict) and "effort" in effective["output_config"]:
+            oc_obj = effective["output_config"]
+            oc_c = profile.constraints.get("output_config.effort")
+            if oc_c and oc_c.kind == "enum" and not oc_c.accepts(oc_obj["effort"]):
+                old_oc_eff = oc_obj["effort"]
+                oc_obj["effort"] = "max" if "max" in oc_c.values else ("high" if "high" in oc_c.values else oc_c.values[-1])
+                changes.append({"id": "clamp-output-config-effort", "path": "output_config.effort", "requested": old_oc_eff, "was_missing": False,
+                                "effective": oc_obj["effort"], "removed": False, "reason": "Clamp output_config.effort to profile domain", "effects": "Normalized output_config.effort"})
+        if (isinstance(thinking, dict) and thinking.get("type") in {"enabled", "adaptive"}) or "reasoning" in profile.capabilities:
             for temp_field in ("temperature", "top_p"):
                 if temp_field in effective:
                     old = effective.pop(temp_field)
                     changes.append({"id": f"strip-{temp_field}-thinking", "path": temp_field, "requested": old, "was_missing": False,
                                     "effective": None, "removed": True, "reason": "Thinking requires unset sampling parameters", "effects": f"Removed {temp_field}"})
-        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
-            budget = thinking.get("budget_tokens")
-            if type(budget) is int and type(effective.get("max_tokens")) is int and effective["max_tokens"] <= budget:
+        if isinstance(thinking, dict) and type(requested_budget) is int:
+            if type(effective.get("max_tokens")) is int and effective["max_tokens"] <= requested_budget:
                 old = effective["max_tokens"]
-                effective["max_tokens"] = min(max_cap, budget + 4096)
+                effective["max_tokens"] = min(max_cap, requested_budget + 4096)
                 changes.append({"id": "bump-max-tokens-for-thinking", "path": "max_tokens", "requested": old, "was_missing": False,
                                 "effective": effective["max_tokens"], "removed": False, "reason": "max_tokens must exceed thinking.budget_tokens", "effects": "Increased max_tokens"})
     key = "input" if protocol == "responses" else "messages"
@@ -335,7 +369,8 @@ def prepare(body, profile):
     effective, changes = apply_rules(body, profile)
     changes = pre_changes + changes
     reasoning_fields = {"effort", "summary"} if isinstance(profile, ProfileV2) else {"effort"}
-    for field, known in (("reasoning", reasoning_fields), ("thinking", {"type", "budget_tokens"}),
+    thinking_fields = {"type", "budget_tokens", "display"} if (isinstance(profile, ProfileV2) and isinstance(effective.get("thinking"), dict) and effective["thinking"].get("type") == "adaptive" and effective["thinking"].get("display") in {"summarized", "omitted"}) else {"type", "budget_tokens"}
+    for field, known in (("reasoning", reasoning_fields), ("thinking", thinking_fields),
                          ("stream_options", {"include_usage"}), ("output_config", {"effort", "format"}),
                          ("text", {"format"})):
         if field in effective and (not isinstance(effective[field], dict) or not set(effective[field]) <= known):

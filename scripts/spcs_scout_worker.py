@@ -88,13 +88,25 @@ def build_profile_v2(
         }
         stream_mode = "ordered-items"
     else:
+        low_id = model_id.lower()
+        is_adaptive_only = any(tag in low_id for tag in ("-5-", "-5.", "fable", "mythos", "-4-7", "-4.7", "-4-8", "-4.8"))
+        is_adaptive_46 = any(tag in low_id for tag in ("-4-6", "-4.6"))
+        if is_adaptive_only:
+            thinking_types = ["enabled", "disabled", "adaptive"]
+            efforts = ["low", "medium", "high", "xhigh", "max"]
+        elif is_adaptive_46:
+            thinking_types = ["enabled", "disabled", "adaptive"]
+            efforts = ["low", "medium", "high", "max"]
+        else:
+            thinking_types = ["enabled", "disabled"]
+            efforts = ["low", "medium", "high"]
         constraints = {
             "max_tokens": OptionConstraint(kind="integer", minimum=1, maximum=128000),
             "temperature": OptionConstraint(kind="number", minimum=0.0, maximum=1.0),
             "top_p": OptionConstraint(kind="number", minimum=0.0, maximum=1.0),
-            "thinking.type": OptionConstraint(kind="enum", values=["enabled", "disabled"]),
+            "thinking.type": OptionConstraint(kind="enum", values=thinking_types),
             "thinking.budget_tokens": OptionConstraint(kind="integer", minimum=1024, maximum=64000),
-            "output_config.effort": OptionConstraint(kind="enum", values=["low", "medium", "high"]),
+            "output_config.effort": OptionConstraint(kind="enum", values=efforts),
             "tool_choice.type": OptionConstraint(kind="enum", values=["auto", "none"]),
             "tool_choice.disable_parallel_tool_use": OptionConstraint(kind="enum", values=[True, False]),
         }

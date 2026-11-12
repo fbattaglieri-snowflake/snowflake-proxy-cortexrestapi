@@ -124,6 +124,8 @@ class Stream:
         self.response_id = None
         self.sequence = -1
         self.message_stopped = False
+        self.prefix_frames = b""
+        self.suppress_frame = False
 
     def event(self, raw):
         lines = raw.decode("utf-8").splitlines()
@@ -147,17 +149,22 @@ class Stream:
             require(len(names) == 1 and names[0] == body.get("type"), "Event type mismatch")
         if body.get("error") or body.get("type") == "error":
             raise ProtocolError("Upstream stream error")
+        self.prefix_frames = b""
+        self.suppress_frame = False
         if self.protocol == "chat":
             self.chat(body)
         elif self.protocol == "messages":
             self.messages(body)
         else:
             self.responses(body)
+        if self.suppress_frame:
+            return b""
         mapped = map_model(body, self.protocol, self.profile)
-        if mapped == body:
+        if mapped == body and not self.prefix_frames:
             return raw
         metadata = [line for line in lines if line and not line.startswith("data:")]
-        return ("\n".join(metadata) + ("\n" if metadata else "") + "data: " + canonical(mapped).decode() + "\n\n").encode()
+        rendered = ("\n".join(metadata) + ("\n" if metadata else "") + "data: " + canonical(mapped).decode() + "\n\n").encode() if mapped != body else raw
+        return self.prefix_frames + rendered
 
     def chat(self, body):
         for choice in body.get("choices", []):
@@ -201,6 +208,13 @@ class Stream:
             self.started = True
             return
         require(self.started, "Missing message start")
+        if self.message_stopped and kind == "content_block_stop":
+            index = body.get("index")
+            state = self.blocks.get(index) if type(index) is int else None
+            if state is not None and state.get("auto_closed"):
+                state["auto_closed"] = False
+                self.suppress_frame = True
+                return
         require(not self.message_stopped or kind == "message_stop", "Content after message delta")
         if kind == "content_block_start":
             index = body.get("index")
@@ -247,9 +261,16 @@ class Stream:
             else:
                 state["closed"] = True
         elif kind == "message_delta":
-            require(all(state["closed"] for state in self.blocks.values()), "Message delta before block stop")
             self.stop_reason = body.get("delta", {}).get("stop_reason")
             require(self.stop_reason is not None, "Missing message stop reason")
+            for idx, state in sorted(self.blocks.items()):
+                if not state["closed"]:
+                    require(self.stop_reason in {"max_tokens", "refusal", "pause_turn", "stop_sequence", "end_turn", "tool_use"},
+                            "Message delta before block stop")
+                    state["closed"] = True
+                    state["auto_closed"] = True
+                    stop_payload = canonical({"type": "content_block_stop", "index": idx}).decode()
+                    self.prefix_frames += f"event: content_block_stop\ndata: {stop_payload}\n\n".encode()
             self.message_stopped = True
         elif kind == "message_stop":
             require(self.message_stopped and all(state["closed"] for state in self.blocks.values()), "Unclosed message")
@@ -259,7 +280,7 @@ class Stream:
                 if block.get("type") == "tool_use" and state["arguments"]:
                     if self.stop_reason == "tool_use":
                         block["input"] = strict_json(state["arguments"])
-                if block.get("type") == "thinking" and self.stop_reason not in {"max_tokens", "refusal"}:
+                if block.get("type") == "thinking" and self.stop_reason not in {"max_tokens", "refusal", "pause_turn"}:
                     require(bool(block.get("signature")), "Missing thinking signature")
                 content.append(block)
             validate_document({"type": "message", "content": content, "stop_reason": self.stop_reason}, "messages")

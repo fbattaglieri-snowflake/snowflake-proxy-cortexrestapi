@@ -206,6 +206,23 @@ class StreamLifecycleTests(unittest.TestCase):
             with self.subTest(case=case), self.assertRaises(ProtocolError):
                 self.validate("messages", case)
 
+    def test_messages_auto_closes_open_block_on_message_delta(self):
+        values, _ = messages_tools(1)
+        # Simulate Cortex /messages omitting content_block_stop before message_delta on max_tokens truncation
+        omitted = [e for e in copy.deepcopy(values) if not (e.get("type") == "content_block_stop" and e.get("index") == 2)]
+        omitted[-2] = {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 180}}
+        validator = Stream("messages", profile("messages", capabilities=["text", "tools", "parallel_tools", "reasoning", "streaming"]))
+        emitted = b"".join(validator.event(event) for event in SSEParser().feed(test_app.sse("messages", omitted)))
+        validator.finish()
+        self.assertIn(b'"index":2,"type":"content_block_stop"', emitted)
+        # Also verify late duplicate content_block_stop after message_delta is absorbed cleanly
+        reordered = copy.deepcopy(omitted)
+        reordered.insert(-1, {"type": "content_block_stop", "index": 2})
+        validator2 = Stream("messages", profile("messages", capabilities=["text", "tools", "parallel_tools", "reasoning", "streaming"]))
+        emitted2 = b"".join(validator2.event(event) for event in SSEParser().feed(test_app.sse("messages", reordered)))
+        validator2.finish()
+        self.assertEqual(emitted2.count(b'"index":2,"type":"content_block_stop"'), 1)
+
     def test_responses_opaque_and_arguments_identity(self):
         values, _ = responses_tools(2)
         self.validate("responses", values)

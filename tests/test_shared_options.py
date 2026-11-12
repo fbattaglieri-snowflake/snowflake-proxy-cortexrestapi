@@ -132,6 +132,31 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(eff_r["reasoning"], {"effort": "low", "summary": "auto"})
         self.assertNotIn("prompt_cache_retention", eff_r)
         self.assertTrue(any(c["id"] == "clamp-reasoning-effort" for c in changes_r))
+        # Adaptive-only profile (claude-fable-5-2 / claude-opus-5-5): preserves adaptive+summarized and converts enabled->adaptive
+        fable_data = flexible("messages", capabilities=["text", "reasoning"]).document()
+        fable_data["normalize_client_options"] = True
+        fable_data["constraints"].update({
+            "thinking.type": {"kind": "enum", "values": ["adaptive"]},
+            "output_config.effort": {"kind": "enum", "values": ["low", "medium", "high", "max"]},
+        })
+        fable_prof = ProfileV2.model_validate(fable_data)
+        eff_f1, _ = prepare({
+            "model": fable_prof.id,
+            "messages": [{"role": "user", "content": "portfolio analysis"}],
+            "max_tokens": 32768,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "xhigh"},
+        }, fable_prof)
+        self.assertEqual(eff_f1["thinking"], {"type": "adaptive", "display": "summarized"})
+        self.assertEqual(eff_f1["output_config"], {"effort": "max"})
+        eff_f2, changes_f2 = prepare({
+            "model": fable_prof.id,
+            "messages": [{"role": "user", "content": "legacy thinking"}],
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+        }, fable_prof)
+        self.assertEqual(eff_f2["thinking"], {"type": "adaptive"})
+        self.assertTrue(any(c["id"] == "normalize-thinking-to-adaptive" for c in changes_f2))
 
 
 class HTTPOptionTests(unittest.IsolatedAsyncioTestCase):
