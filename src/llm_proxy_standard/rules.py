@@ -233,12 +233,16 @@ def _normalize_client_body(body, profile):
         is_adaptive_only = any(tag in low_id for tag in ("-5-", "-5.", "fable", "mythos", "-4-7", "-4.7", "-4-8", "-4.8")) or (
             t_constraint is not None and t_constraint.kind == "enum" and t_constraint.values == ["adaptive"]
         )
-        if thinking is None and is_adaptive_only and (t_constraint is None or t_constraint.accepts("adaptive")) and effective.get("max_tokens") == 2048:
+        is_mandatory_adaptive = any(tag in low_id for tag in ("fable", "mythos", "opus-5-", "opus-5.")) or (
+            t_constraint is not None and t_constraint.kind == "enum" and t_constraint.values == ["adaptive"]
+        )
+        if thinking is None and is_mandatory_adaptive and (t_constraint is None or t_constraint.accepts("adaptive")) and effective.get("max_tokens") in {1024, 1500, 2048, 3072, 4096}:
+            old_mt = effective.get("max_tokens")
             effective["max_tokens"] = min(max_cap, 32768)
             effective["thinking"] = {"type": "adaptive", "display": "summarized"}
             thinking = effective["thinking"]
-            changes.append({"id": "upgrade-adaptive-max-tokens", "path": "max_tokens", "requested": 2048, "was_missing": False,
-                            "effective": effective["max_tokens"], "removed": False, "reason": "Mandatory adaptive thinking model requires >2048 max_tokens budget", "effects": "Increased max_tokens to 32768"})
+            changes.append({"id": "upgrade-adaptive-max-tokens", "path": "max_tokens", "requested": old_mt, "was_missing": False,
+                            "effective": effective["max_tokens"], "removed": False, "reason": "Mandatory adaptive thinking model requires >4096 max_tokens budget", "effects": "Increased max_tokens to 32768"})
             oc_c = profile.constraints.get("output_config.effort")
             if "output_config" not in effective and (oc_c is None or oc_c.accepts("medium")):
                 effective["output_config"] = {"effort": "medium"}
@@ -252,6 +256,11 @@ def _normalize_client_body(body, profile):
                 thinking = effective["thinking"]
                 changes.append({"id": "normalize-thinking-to-adaptive", "path": "thinking", "requested": old_t, "was_missing": False,
                                 "effective": {"type": "adaptive"}, "removed": False, "reason": "Model requires adaptive thinking", "effects": "Converted enabled thinking to adaptive"})
+                oc_c = profile.constraints.get("output_config.effort")
+                if "output_config" not in effective and (oc_c is None or oc_c.accepts("medium")):
+                    effective["output_config"] = {"effort": "medium"}
+                    changes.append({"id": "default-adaptive-effort", "path": "output_config.effort", "requested": None, "was_missing": True,
+                                    "effective": "medium", "removed": False, "reason": "Bound adaptive thinking effort", "effects": "Set output_config.effort=medium"})
             elif (is_adaptive_only and thinking.get("type") == "disabled") or (t_constraint and not t_constraint.accepts(thinking.get("type"))):
                 old_t = effective.pop("thinking")
                 changes.append({"id": "strip-unsupported-thinking-type", "path": "thinking", "requested": old_t, "was_missing": False,

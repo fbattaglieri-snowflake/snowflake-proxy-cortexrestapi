@@ -24,7 +24,7 @@ Create three credentials in n8n:
 3. **Anthropic API (Messages API):**
    - **Base URL:** `ORIGIN/messages`
    - **API Key:** `internal-spcs`
-   - (The proxy automatically rehydrates `thinking` signatures across tool turns via `ReplayCache`).
+   - (The proxy automatically rehydrates `thinking` signatures across tool turns via `ReplayCache`, converts `thinking.type="enabled"` to `"adaptive"` + `output_config={"effort": "medium"}` on Claude 5.x models, upgrades small client default `max_tokens` (`omitted`/`1024`/`1500`/`2048`/`3072`/`4096`) to `32768` on mandatory-adaptive models such as `claude-fable-5-2` and `claude-opus-5-5`, and synthesizes missing `content_block_stop` SSE frames if a block is truncated mid-stream).
 
 All three credentials dynamically populate the model dropdown from `GET /<protocol>/v1/models`.
 

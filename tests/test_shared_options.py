@@ -156,7 +156,17 @@ class OptionTests(unittest.TestCase):
             "thinking": {"type": "enabled", "budget_tokens": 2048},
         }, fable_prof)
         self.assertEqual(eff_f2["thinking"], {"type": "adaptive"})
+        self.assertEqual(eff_f2["output_config"], {"effort": "medium"})
         self.assertTrue(any(c["id"] == "normalize-thinking-to-adaptive" for c in changes_f2))
+        for client_default in (None, 1024, 1500, 2048, 3072, 4096):
+            req_body = {"model": fable_prof.id, "messages": [{"role": "user", "content": "client default"}]}
+            if client_default is not None:
+                req_body["max_tokens"] = client_default
+            eff_def, changes_def = prepare(req_body, fable_prof)
+            self.assertEqual(eff_def["max_tokens"], 32768)
+            self.assertEqual(eff_def["thinking"], {"type": "adaptive", "display": "summarized"})
+            self.assertEqual(eff_def["output_config"], {"effort": "medium"})
+            self.assertTrue(any(c["id"] == "upgrade-adaptive-max-tokens" for c in changes_def))
 
 
 class HTTPOptionTests(unittest.IsolatedAsyncioTestCase):
