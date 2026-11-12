@@ -157,7 +157,7 @@ def main(session):
     added_all = sorted(set(curr_map) - set(prev_map))
     removed_all = sorted(set(prev_map) - set(curr_map))
     added_cortex_base = [m for m in added_all if str(curr_map[m].get('model_type', '')).upper() == 'CORTEX_BASE']
-    disappeared_active = sorted(m for m in active_set if m.lower() not in curr_map)
+    disappeared_active = sorted(m for m in active_set if m.lower() in removed_all)
 
     action_taken = bool(added_cortex_base or disappeared_active)
     tested_models = []

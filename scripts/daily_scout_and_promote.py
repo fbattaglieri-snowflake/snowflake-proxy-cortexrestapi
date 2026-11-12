@@ -471,20 +471,20 @@ def scout_and_qualify_new_model(
             fast_channel_probe(cfg.upstream_url, token, auth_type, model_id, "chat", reasoning="low").get("reachable")
         )
     qual["supports_reasoning_effort"] = supports_re_effort
-    both_upstreams_ok = bool(qual.get("promotable")) and bool(companion_probe.get("reachable"))
+    promotable_ok = bool(qual.get("promotable"))
 
     return {
         "model": model_id,
-        "status": "PROFILE_QUALIFIED" if both_upstreams_ok else "PROFILE_BLOCKED",
-        "promotable": both_upstreams_ok,
+        "status": "PROFILE_QUALIFIED" if promotable_ok else "PROFILE_BLOCKED",
+        "promotable": promotable_ok,
         "channel": proto,
         "reasoning": reas,
         "supports_reasoning_effort": supports_re_effort,
         "cortex_rest_reachable": True if cfg.upstream_url == cfg.cortex_upstream_url else bool(companion_probe.get("reachable")),
         "ai_gateway_reachable": True if cfg.upstream_url == cfg.gateway_upstream_url else bool(companion_probe.get("reachable")),
         "reason": (
-            f"Qualified on channel '{proto}' across Cortex REST & AI Gateway ({qual['counts'].get('PASS', 0)} PASS / {qual['counts'].get('FAIL', 0)} FAIL)"
-            if both_upstreams_ok
+            f"Qualified on channel '{proto}' ({qual['counts'].get('PASS', 0)} PASS / {qual['counts'].get('FAIL', 0)} FAIL, companion_reachable={companion_probe.get('reachable')})"
+            if promotable_ok
             else f"Blocked on channel '{proto}' ({qual['counts'].get('PASS', 0)} PASS / {qual['counts'].get('FAIL', 0)} FAIL, companion_reachable={companion_probe.get('reachable')})"
         ),
         "preflight": preflight_results,
@@ -849,7 +849,7 @@ def run_daily_scouting(cfg: ScoutConfig) -> dict[str, Any]:
     added_cortex_base = [
         m for m in added_all if str(curr_models_map[m].get("model_type", "")).upper() == "CORTEX_BASE"
     ]
-    disappeared_active = sorted(m for m in active_set if m.lower() not in curr_models_map)
+    disappeared_active = sorted(m for m in active_set if m.lower() in removed_all)
 
     models_to_test: list[str] = []
     for m in added_cortex_base:
@@ -863,7 +863,7 @@ def run_daily_scouting(cfg: ScoutConfig) -> dict[str, Any]:
 
     for fm in cfg.force_models:
         fm_low = fm.lower()
-        if fm_low in curr_models_map and fm_low not in models_to_test:
+        if fm_low not in models_to_test:
             models_to_test.append(fm_low)
 
     tested_results: list[dict[str, Any]] = []
@@ -877,7 +877,7 @@ def run_daily_scouting(cfg: ScoutConfig) -> dict[str, Any]:
         for m_id in models_to_test:
             outcome = scout_and_qualify_new_model(cfg, token, auth_type, m_id, run_dir)
             tested_results.append(outcome)
-            created_on = curr_models_map[m_id].get("created_on")
+            created_on = (curr_models_map.get(m_id) or {}).get("created_on", "voltron-prpr")
             if outcome.get("promotable"):
                 qualified_items.append(outcome)
                 ledger["promoted"][m_id] = {
