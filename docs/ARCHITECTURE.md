@@ -43,6 +43,10 @@ When `ProfileV2.normalize_client_options = True`, the proxy transparently normal
    - Automatically renames reused tool call IDs (`call_0..call_N`) from prior closed turns (`call_0` -> `call_0_r2`) in both the assistant turn and matching tool result.
 6. **1M+ Token Context & Long-Stream Resource Bounds (`app.py`):**
    - Defaults `max_body = 32 MiB` (`PROXY_MAX_BODY=33554432`), `max_response = 32 MiB` (`PROXY_MAX_RESPONSE=33554432`), `deadline = 600s` (`PROXY_DEADLINE=600`), and upstream `httpx.Timeout(180, connect=10, write=60, pool=5)` so 1M+ token context windows (`openai-gpt-6-astra`, `openai-gpt-6.1-sol`, `claude-opus-5-5`) with multi-round `reasoning.encrypted_content` blobs and long context-compression streams complete without premature `HTTP 413` rejections or mid-stream cutoff (`incomplete chunked read`).
+7. **Upstream Rate-Limit & Overload Resilience (`app.py`):**
+   - On `ProfileV2` (`normalize_client_options = True`), transparently retries transient upstream `HTTP 429`, `503`, and `529` responses across a 100-second exponential schedule (`3s, 7s, 15s, 30s, 45s`) while observing client disconnects (`until_disconnect`) and recording `upstream-rate-limit-retry` in `x-proxy-adjustments`.
+   - Parses numeric, Go-style duration (`1m10s`, `500ms`), ISO-8601 (`anthropic-ratelimit-*-reset`), and RFC 7231 HTTP-date reset headers without allowing zero or sub-window `Retry-After` hints to collapse subsequent backoff steps.
+   - If upstream throttling persists past all proxy retries, emits standard `error.type = "rate_limit_error"` on `429` (`"overloaded_error"` on `529`) and forwards a `Retry-After` header so downstream agent loops (`Hermes`, `LangChain`, `n8n`, `Langflow`) classify and back off cleanly.
 
 ## 4. Stateless Client `ReplayCache` (`replay_cache.py`)
 

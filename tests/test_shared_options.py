@@ -262,3 +262,56 @@ class HTTPOptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
         adj = json.loads(base64.urlsafe_b64decode(result.headers["x-proxy-adjustments"] + "===").decode())
         self.assertTrue(any(c["id"] == "upstream-rate-limit-retry" and c["requested"] == 429 for c in adj))
+
+    def test_retry_after_header_parsing_formats(self):
+        from datetime import datetime, timezone
+        from email.utils import format_datetime
+        import time
+        from llm_proxy_standard.app import _parse_retry_after_seconds
+        self.assertIsNone(_parse_retry_after_seconds({}))
+        self.assertIsNone(_parse_retry_after_seconds({"retry-after": "0"}))
+        self.assertIsNone(_parse_retry_after_seconds({"retry-after": "-3"}))
+        self.assertAlmostEqual(_parse_retry_after_seconds({"retry-after": "12.5"}), 12.5)
+        self.assertAlmostEqual(_parse_retry_after_seconds({"x-ratelimit-reset-tokens": "1m10s"}), 70.0)
+        self.assertAlmostEqual(_parse_retry_after_seconds({"x-ratelimit-reset-requests": "500ms"}), 0.5)
+        future_dt = datetime.fromtimestamp(time.time() + 25.0, tz=timezone.utc)
+        iso_val = _parse_retry_after_seconds({"anthropic-ratelimit-input-tokens-reset": future_dt.isoformat()})
+        self.assertTrue(20.0 <= iso_val <= 30.0)
+        http_val = _parse_retry_after_seconds({"retry-after": format_datetime(future_dt, usegmt=True)})
+        self.assertTrue(20.0 <= http_val <= 30.0)
+
+    async def test_exhausted_429_and_529_emit_standard_error_type_and_retry_after(self):
+        import httpx
+        from llm_proxy_standard.app import Settings, create_app
+        from llm_proxy_standard.cache import SnapshotCache
+        from tests.support import UPSTREAM
+        data = flexible("messages", capabilities=["text", "reasoning"]).document()
+        data["normalize_client_options"] = True
+        value = ProfileV2.model_validate(data)
+        doc = self.authority.snapshot(value).document()
+        async def fetch():
+            return doc
+        cache = SnapshotCache(fetch, self.authority.trust)
+        calls = []
+        status_to_send = [429]
+        def persistent_handler(request):
+            calls.append(request)
+            return httpx.Response(status_to_send[0], headers={"x-ratelimit-reset-tokens": "18s"}, json={"private": "secret"})
+        fast_settings = Settings(UPSTREAM, self.token, retry_delays=(0.005, 0.01))
+        app = create_app(fast_settings, cache, transport=httpx.MockTransport(persistent_handler))
+        async with app.router.lifespan_context(app), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy.invalid") as client:
+            res_429 = await client.post("/messages/v1/messages", json={**test_app.payload("messages"), "max_tokens": 2048})
+            self.assertEqual(res_429.status_code, 429)
+            self.assertEqual(len(calls), 3)
+            body_429 = res_429.json()
+            self.assertEqual(body_429["error"]["type"], "rate_limit_error")
+            self.assertIn("Rate limit exceeded", body_429["error"]["message"])
+            self.assertEqual(res_429.headers.get("retry-after"), "18")
+            self.assertNotIn("secret", res_429.text)
+            calls.clear()
+            status_to_send[0] = 529
+            res_529 = await client.post("/messages/v1/messages", json={**test_app.payload("messages"), "max_tokens": 2048})
+            self.assertEqual(res_529.status_code, 529)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(res_529.json()["error"]["type"], "overloaded_error")
+            self.assertEqual(res_529.headers.get("retry-after"), "18")

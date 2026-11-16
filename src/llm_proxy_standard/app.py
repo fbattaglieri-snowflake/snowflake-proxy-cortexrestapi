@@ -3,6 +3,8 @@ import asyncio
 import base64
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 import os
 from pathlib import Path
 import re
@@ -24,6 +26,46 @@ from .rules import RequestPolicyError, prepare
 from .stream_order import OrderedItems
 
 SUFFIX = {"chat": "/chat/completions", "responses": "/responses", "messages": "/messages"}
+_DURATION_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
+
+
+def _parse_retry_after_seconds(headers):
+    """Extract a positive retry wait in seconds from upstream rate-limit headers."""
+    if not headers:
+        return None
+    now_epoch = time.time()
+    for name in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests",
+                 "anthropic-ratelimit-input-tokens-reset", "anthropic-ratelimit-tokens-reset",
+                 "anthropic-ratelimit-requests-reset"):
+        raw = (headers.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+            continue
+        except ValueError:
+            pass
+        parts = _DURATION_TOKEN_RE.findall(raw.lower())
+        if parts and "".join(num + unit for num, unit in parts) == raw.lower().replace(" ", ""):
+            mult = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+            total = sum(float(num) * mult[unit] for num, unit in parts)
+            if total > 0:
+                return total
+            continue
+        for parse_fn in (
+            lambda s: datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp(),
+            lambda s: parsedate_to_datetime(s).timestamp(),
+        ):
+            try:
+                delta = parse_fn(raw) - now_epoch
+                if delta > 0:
+                    return delta
+                break
+            except Exception:
+                pass
+    return None
 
 
 @dataclass(frozen=True)
@@ -37,6 +79,7 @@ class Settings:
     max_body: int = 32 * 1024 * 1024
     max_response: int = 32 * 1024 * 1024
     send_timeout: float = 30
+    retry_delays: tuple = (3.0, 7.0, 15.0, 30.0, 45.0)
 
     def __post_init__(self):
         parsed = urlsplit(self.upstream)
@@ -122,8 +165,15 @@ class BoundedStreamingResponse(StreamingResponse):
                     await self.cleanup()
 
 
-def error(protocol, status, message, request_id, *, code=None, field=None):
-    kind = "invalid_request_error" if status < 500 else "api_error"
+def error(protocol, status, message, request_id, *, code=None, field=None, extra_headers=None):
+    if status == 429:
+        kind = "rate_limit_error"
+    elif status == 529:
+        kind = "overloaded_error"
+    elif status >= 500:
+        kind = "api_error"
+    else:
+        kind = "invalid_request_error"
     body = {"error": {"type": kind, "message": message}, "request_id": request_id}
     if code:
         body["error"]["code"] = code
@@ -131,7 +181,10 @@ def error(protocol, status, message, request_id, *, code=None, field=None):
         body["error"]["param"] = field
     if protocol == "messages":
         body["type"] = "error"
-    return JSONResponse(body, status_code=status, headers={"x-request-id": request_id})
+    resp_headers = {"x-request-id": request_id}
+    if extra_headers:
+        resp_headers.update(extra_headers)
+    return JSONResponse(body, status_code=status, headers=resp_headers)
 
 
 def create_app(settings, cache, *, transport=None):
@@ -229,7 +282,7 @@ def create_app(settings, cache, *, transport=None):
                     try:
                         await admission.acquire()
                     except (Unavailable, TimeoutError):
-                        return error(protocol, 429, "Bounded admission limit reached", request_id)
+                        return error(protocol, 429, "Bounded admission limit reached", request_id, extra_headers={"Retry-After": "2"})
                     acquired = True
                     raw = bytearray()
                     async for chunk in request.stream():
@@ -250,8 +303,9 @@ def create_app(settings, cache, *, transport=None):
                     current = cache.resolve(protocol, profile.id)
                     if current != profile:
                         raise Unavailable("Profile changed while waiting")
-                    retry_delays = (2.5, 6.0, 14.0, 25.0) if getattr(profile, "normalize_client_options", False) else ()
+                    retry_delays = tuple(settings.retry_delays) if getattr(profile, "normalize_client_options", False) else ()
                     prev_status = None
+                    last_retry_hint = None
                     for attempt_idx in range(len(retry_delays) + 1):
                         token = settings.token_path.read_text().strip()
                         if not token:
@@ -269,21 +323,30 @@ def create_app(settings, cache, *, transport=None):
                                                 "reason": "Transient upstream rate limit or overload", "effects": f"Retried {attempt_idx} time(s)"})
                             break
                         prev_status = response.status_code
-                        retry_after_raw = response.headers.get("retry-after") or response.headers.get("x-ratelimit-reset-requests")
+                        hinted = _parse_retry_after_seconds(response.headers)
+                        last_retry_hint = hinted
                         await response.aclose()
                         response = None
-                        delay = retry_delays[attempt_idx]
-                        if retry_after_raw:
-                            try:
-                                delay = max(0.01, min(30.0, float(retry_after_raw)))
-                            except ValueError:
-                                pass
+                        base_delay = retry_delays[attempt_idx]
+                        if hinted is not None:
+                            delay = min(90.0, hinted if attempt_idx == 0 else max(base_delay, hinted))
+                        else:
+                            delay = base_delay
                         if time.monotonic() + delay >= expires:
-                            return error(protocol, prev_status, f"Upstream HTTP {prev_status}; retry budget exceeded deadline", request_id)
+                            ra_hdr = {"Retry-After": str(max(1, int(round(hinted or 15.0))))} if prev_status in {429, 503, 529} else None
+                            return error(protocol, prev_status, f"Rate limit or overload persisted (upstream HTTP {prev_status}; retry budget exceeded deadline)", request_id, extra_headers=ra_hdr)
                         await until_disconnect(request, asyncio.sleep(delay))
                     if not 200 <= response.status_code < 300:
                         status = response.status_code if response.status_code >= 400 else 502
-                        return error(protocol, status, f"Upstream HTTP {response.status_code}; no retry or fallback", request_id)
+                        final_hint = _parse_retry_after_seconds(response.headers) or last_retry_hint
+                        if status in {429, 503, 529} and attempt_idx > 0:
+                            ra_secs = max(1, min(600, int(round(final_hint or 15.0))))
+                            msg = (f"Rate limit exceeded (upstream HTTP 429 persisted after {attempt_idx} proxy retries)"
+                                   if status == 429 else
+                                   f"Service temporarily overloaded (upstream HTTP {status} persisted after {attempt_idx} proxy retries)")
+                            return error(protocol, status, msg, request_id, extra_headers={"Retry-After": str(ra_secs)})
+                        ra_hdr = {"Retry-After": str(max(1, min(600, int(round(final_hint)))))} if status in {429, 503, 529} and final_hint else None
+                        return error(protocol, status, f"Upstream HTTP {response.status_code}; no retry or fallback", request_id, extra_headers=ra_hdr)
                     metadata = {"x-request-id": request_id, "x-proxy-revision": revision,
                                 "x-proxy-profile": digest(profile.document()), "Cache-Control": "no-store",
                                 "x-proxy-replica": replica, "x-proxy-release": release}
