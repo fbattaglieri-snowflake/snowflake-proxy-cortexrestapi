@@ -14,7 +14,7 @@
 
 ## 2. Authentication Translation (SPCS OAuth)
 
-Inside Snowpark Container Services, Snowflake mounts a fresh OAuth token at `/snowflake/session/token`. External tools (`n8n`, `Hermes`, `Langflow`, `LangChain`) inside the same SPCS network connect to the proxy over internal DNS (`*.svc.spcs.internal`) using a dummy placeholder API key, and the proxy injects on every request:
+Inside Snowpark Container Services, Snowflake mounts a fresh OAuth token at `/snowflake/session/token`. The proxy automatically normalizes underscores (`_`) to hyphens (`-`) in `SNOWFLAKE_HOST` (or `PROXY_UPSTREAM_HOST`) for valid TLS wildcard hostname verification on `*.snowflakecomputing.com`. External tools (`n8n`, `Hermes`, `Langflow`, `LangChain`) inside the same SPCS network connect to the proxy over internal DNS (`*.svc.spcs.internal`) using a dummy placeholder API key, and the proxy injects on every request:
 
 - `Authorization: Bearer <token_from_/snowflake/session/token>`
 - `X-Snowflake-Authorization-Token-Type: OAUTH`
@@ -36,8 +36,8 @@ When `ProfileV2.normalize_client_options = True`, the proxy transparently normal
    - Converts `max_tokens` to `max_completion_tokens` when `max_completion_tokens` is absent (`rename-max-tokens-to-completion`), and resolves conflicts when a client sends both (`dedup-max-tokens`).
    - Sets `reasoning_effort = "none"` when required by a profile (even if the client sends `"medium"` or omits it), and removes `reasoning_effort` on Chat models that do not support it.
 4. **Messages Protocol Adjustments:**
-   - When `thinking.type` is outside the profile's supported enum (for example `"adaptive"` sent by clients before profile negotiation), strips the unsupported `thinking` block and paired `output_config.effort` instead of failing with `HTTP 400`.
-   - When `thinking.type == "enabled"`, strips incompatible `temperature` / `top_p` parameters and bumps `max_tokens` if `max_tokens <= thinking.budget_tokens`.
+   - On Claude 5.x models supporting `adaptive` thinking, converts `thinking.type = "enabled"` to `"adaptive"` + `output_config = {"effort": "medium"}` and upgrades small client default `max_tokens` (`omitted`/`1024`/`1500`/`2048`/`3072`/`4096`) to `32768` on mandatory-adaptive models (`claude-fable-5-2`, `claude-opus-5-5`). When `thinking.type` is outside a profile's supported enum, strips the unsupported `thinking` block and paired `output_config.effort` instead of failing with `HTTP 400`.
+   - When `thinking` is active, strips incompatible `temperature` / `top_p` parameters, bumps `max_tokens` if `max_tokens <= thinking.budget_tokens`, and synthesizes missing `content_block_stop` SSE frames if a block is truncated mid-stream.
    - Normalizes string `tool_choice` (`"auto"` / `"none"`) to `{"type": ...}`.
 5. **Multi-Round Tool Call ID Deduplication:**
    - Automatically renames reused tool call IDs (`call_0..call_N`) from prior closed turns (`call_0` -> `call_0_r2`) in both the assistant turn and matching tool result.

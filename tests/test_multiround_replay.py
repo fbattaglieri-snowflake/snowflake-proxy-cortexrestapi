@@ -361,5 +361,12 @@ class MultiRoundTests(unittest.IsolatedAsyncioTestCase):
                 cache = SnapshotCache(fetch, trust)
                 self.assertTrue(await cache.refresh())
                 self.assertEqual([p.id for p in cache.profiles('chat')], ['grok-4.7'])
+                # Shared Single-Writer Registry compatibility across /api/v2/cortex/v1 and /api/v2/aigateways/<gw>/v1
+                gw_trust = Trust({}, 'EXAMPLE_ACCOUNT', 'b' * 64,
+                                 'https://example_account.snowflakecomputing.com/api/v2/aigateways/snowflake/v1',
+                                 admin_approvers=['operator-admin'], historical_artifacts=[artifact], serve_historical_artifacts=True)
+                gw_cache = SnapshotCache(fetch, gw_trust)
+                self.assertTrue(await gw_cache.refresh())
+                self.assertEqual([p.id for p in gw_cache.profiles('chat')], ['grok-4.7'])
             finally:
                 pub.close()

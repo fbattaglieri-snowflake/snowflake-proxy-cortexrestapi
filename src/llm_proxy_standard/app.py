@@ -445,7 +445,8 @@ def create_app(settings, cache, *, transport=None):
 
 
 def environment():
-    host = os.environ["SNOWFLAKE_HOST"]
+    raw_host = os.environ.get("PROXY_UPSTREAM_HOST") or os.environ["SNOWFLAKE_HOST"]
+    host = raw_host.replace("_", "-")
     if not re.fullmatch(r"[a-zA-Z0-9.-]+", host):
         raise ValueError("Invalid platform host")
     limits = {name: int(os.environ[env]) for name, env in {

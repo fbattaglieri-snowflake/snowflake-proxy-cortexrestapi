@@ -4,10 +4,27 @@ from datetime import timedelta
 from contextlib import contextmanager
 import os
 from pathlib import Path
+import re
 import sqlite3
+from urllib.parse import urlsplit
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from .contracts import Entry, ExperimentalApproval, Snapshot, canonical, digest, strict_json, required_coverage, timestamp, utcnow
 from .contracts import RevisionProposal, RevisionSnapshot, parse_snapshot, snapshot_history, validate_revision
+
+_EQUIVALENT_UPSTREAM_RE = re.compile(r"^/api/v2/(?:aigateways/[A-Za-z0-9_.-]+|cortex)/v1$")
+
+
+def _equivalent_snowflake_upstream(url_a, url_b):
+    if url_a == url_b:
+        return True
+    pa, pb = urlsplit(str(url_a)), urlsplit(str(url_b))
+    if (pa.scheme != "https" or pb.scheme != "https" or not pa.hostname or not pb.hostname or
+            pa.port not in (None, 443) or pb.port not in (None, 443) or
+            pa.query or pb.query or pa.fragment or pb.fragment):
+        return False
+    if pa.hostname.lower().replace("_", "-") != pb.hostname.lower().replace("_", "-"):
+        return False
+    return bool(_EQUIVALENT_UPSTREAM_RE.match(pa.path) and _EQUIVALENT_UPSTREAM_RE.match(pb.path))
 
 
 class Trust:
@@ -41,7 +58,8 @@ class Trust:
             raise ValueError("Mixed synthetic evidence")
         allowed_artifacts = {self.artifact} | (self.historical_artifacts if (historical or self.serve_historical_artifacts) else set())
         if (profile.account != self.account or approval.account != self.account or
-                profile.artifact not in allowed_artifacts or proposal.upstream != self.upstream):
+                profile.artifact not in allowed_artifacts or
+                not _equivalent_snowflake_upstream(proposal.upstream, self.upstream)):
             raise ValueError("Release target mismatch")
         if approval.proposal_sha256 != digest(proposal.document()):
             raise ValueError("Approval does not bind this proposal")

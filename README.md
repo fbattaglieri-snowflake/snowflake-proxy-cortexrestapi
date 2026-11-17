@@ -8,7 +8,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](pyproject.toml)
 [![Snowflake SPCS](https://img.shields.io/badge/Snowflake-SPCS%20%26%20Cortex%20REST-29B5E8?style=for-the-badge&logo=snowflake&logoColor=white)](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api)
 [![Protocols](https://img.shields.io/badge/APIs-Messages%20%7C%20Chat%20%7C%20Responses-8A2BE2?style=for-the-badge)](#1-high-level-architecture)
-[![Offline Tests](https://img.shields.io/badge/Unit%20Tests-91%2F91%20PASS-brightgreen?style=for-the-badge)](#quickstart--offline-verification)
+[![Offline Tests](https://img.shields.io/badge/Unit%20Tests-95%2F95%20PASS-brightgreen?style=for-the-badge)](#quickstart--offline-verification)
 
 </div>
 
@@ -27,7 +27,17 @@
 
 > [!NOTE]
 > ### COMPANION REPOSITORY — CORTEX AI GATEWAY EDITION
-> Looking to route your SPCS LLM proxy through **Snowflake Cortex AI Gateway** (`/api/v2/aigateways/snowflake/v1`) with native OpenTelemetry server spans (`TABLE(AGENT_TRACE_TABLE('SNOWFLAKE'))`), OTLP client trace pass-through (`POST /telemetry/v1/traces`), `AI_GATEWAY_USAGE_HISTORY` attribution, and per-user token quotas? See the companion repository: **[`snowflake-proxy-cortex-aigateway`](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortex-aigateway)**. Both repositories are maintained in lockstep.
+> Looking to route your SPCS LLM proxy through **[Snowflake Cortex AI Gateway](https://docs.snowflake.com/en/user-guide/snowflake-cortex/ai-gateway)** (`/api/v2/aigateways/snowflake/v1`) with centralized `ALTER AI GATEWAY` model allowlists, native OpenTelemetry server spans (`TABLE(AGENT_TRACE_TABLE('SNOWFLAKE'))`), OTLP client trace pass-through (`POST /telemetry/v1/traces`), `AI_GATEWAY_USAGE_HISTORY` attribution, and blocking per-user `SNOWFLAKE.CORE.QUOTA` enforcement? See the companion repository: **[`snowflake-proxy-cortex-aigateway`](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortex-aigateway)**. Both repositories are maintained in lockstep and can share a single **`STANDARD_MODEL_REGISTRY (:8090)`** instance on the same `CPU_X64_XS` compute pool via `_equivalent_snowflake_upstream`.
+
+| Dimension | `snowflake-proxy-cortexrestapi` *(This Repo)* | [`snowflake-proxy-cortex-aigateway`](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortex-aigateway) |
+|---|---|---|
+| **Snowflake Upstream Endpoint** | `https://<host>/api/v2/cortex/v1` | `https://<host>/api/v2/aigateways/<gateway>/v1` |
+| **Client Protocol Surfaces (`:8080`)** | `/messages/v1`, `/chat/v1`, `/responses/v1` | `/messages/v1`, `/chat/v1`, `/responses/v1` + `POST /telemetry/v1/traces` |
+| **Usage & Cost Attribution View** | `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_REST_API_USAGE_HISTORY` | `SNOWFLAKE.ACCOUNT_USAGE.AI_GATEWAY_USAGE_HISTORY` |
+| **OpenTelemetry Spans & Quotas** | Standard Cortex REST metering | `TABLE(AGENT_TRACE_TABLE('<GATEWAY>'))` + `SNOWFLAKE.CORE.QUOTA` |
+| **Privilege Model** | `SNOWFLAKE.CORTEX_USER` or `SNOWFLAKE.CORTEX_REST_API_USER` | `USAGE` / `MONITOR` on `AI GATEWAY <name>` |
+| **`ProfileV2` + `OrderedItems` + `ReplayCache` + 429 Retry** | Identical | Identical |
+| **Shared `STANDARD_MODEL_REGISTRY (:8090)`** | Yes (`_equivalent_snowflake_upstream`) | Yes (`_equivalent_snowflake_upstream`) |
 
 ---
 
@@ -264,7 +274,7 @@ snowflake-proxy-cortexrestapi/
 │   ├── ARCHITECTURE.md                             # Deep-dive into data-plane, control-plane & stream ordering
 │   ├── CONSUMERS.md                                # Integration guide for n8n, Hermes, Langflow & LangChain
 │   └── PROMOTION.md                                # Manual & automated daily model scouting/promotion runbook
-└── tests/                                          # 91 offline unit & integration tests (zero network required)
+└── tests/                                          # 95 offline unit & integration tests (zero network required)
 ```
 
 ---
